@@ -39,7 +39,7 @@ export const recommendationService = {
     params?: RecommendationListParams
   ): Promise<RecommendationListResponse> => {
     const response = await api.get<RecommendationListResponse>(
-      '/api/v1/recommendations',
+      '/api/v1/recommendations/',
       { params }
     );
     return response.data;

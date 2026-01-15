@@ -16,7 +16,7 @@ export const statisticsService = {
    * GET /api/v1/statistics
    */
   getStatistics: async (): Promise<StatisticsResponse> => {
-    const response = await api.get<StatisticsResponse>('/api/v1/statistics');
+    const response = await api.get<StatisticsResponse>('/api/v1/statistics/');
     return response.data;
   },
 
