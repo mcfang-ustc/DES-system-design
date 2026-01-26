@@ -51,13 +51,12 @@ async def submit_feedback(feedback_request: FeedbackRequest):
     **Required fields**:
     - recommendation_id: ID of the recommendation to update
     - experiment_result.is_liquid_formed: Whether DES formed liquid phase
-    - experiment_result.measurements: Long-table rows (target_material, time_h, leaching_efficiency, unit, observation)
+    - experiment_result.measurements: Long-table rows (required when is_liquid_formed=True; optional when False)
 
     **Validation rules (enforced in service)**:
-    - At least one measurement row
-    - If is_liquid_formed=True: at least one row with leaching_efficiency
-    - If is_liquid_formed=False: no leaching_efficiency values allowed
-    - time_h >= 0, leaching_efficiency >= 0, unit required per row
+    - If is_liquid_formed=True: at least one measurement row AND at least one row with leaching_efficiency
+    - If is_liquid_formed=False: measurements may be empty; if provided, leaching_efficiency must be absent/0
+    - For each provided measurement row: time_h >= 0, leaching_efficiency >= 0, unit required
 
     **Example request**:
     ```json

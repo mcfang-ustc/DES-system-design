@@ -194,3 +194,5 @@ docker-compose.override.yml
 logs/
 data/recommendations/
 data/memory/
+
+*.7z

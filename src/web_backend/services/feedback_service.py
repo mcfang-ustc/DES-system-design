@@ -290,13 +290,19 @@ class FeedbackService:
         Raises:
             ValueError: If validation fails
         """
-        # Require measurements
-        if not exp_result.measurements or len(exp_result.measurements) == 0:
-            raise ValidationException("At least one measurement is required", field="measurements")
+        measurements = exp_result.measurements or []
+
+        # Require measurements only when liquid formed.
+        # If DES did not form, users may have no valid leaching time-series to report.
+        if exp_result.is_liquid_formed and len(measurements) == 0:
+            raise ValidationException(
+                "At least one measurement is required when is_liquid_formed=True",
+                field="measurements",
+            )
 
         # If liquid formed: require at least one measurement with leaching_efficiency
         if exp_result.is_liquid_formed:
-            has_eff = any((m.leaching_efficiency is not None) for m in exp_result.measurements)
+            has_eff = any((m.leaching_efficiency is not None) for m in measurements)
             if not has_eff:
                 raise ValidationException(
                     "When is_liquid_formed=True, provide at least one measurement.leaching_efficiency",
@@ -306,7 +312,7 @@ class FeedbackService:
             # If not formed, leaching_efficiency should be absent
             bad = [
                 (m.target_material, m.time_h)
-                for m in exp_result.measurements
+                for m in measurements
                 if m.leaching_efficiency not in (None, 0)
             ]
             if bad:
@@ -317,7 +323,7 @@ class FeedbackService:
 
         # Basic measurements sanity checks (no silent fixes)
         seen: set = set()
-        for idx, m in enumerate(exp_result.measurements):
+        for idx, m in enumerate(measurements):
             if m.time_h is None or m.time_h < 0:
                 raise ValidationException(
                     "time_h must be provided and non-negative",
