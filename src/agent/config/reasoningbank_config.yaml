@@ -26,7 +26,7 @@ agent_llm:
   max_tokens: 5000
   # Enable GPT-5.2 reasoning. When reasoning_effort != "none", the client will
   # automatically omit incompatible sampling params (temperature/top_p/logprobs).
-  reasoning_effort: "medium"
+  reasoning_effort: "xhigh"
   verbosity: "medium"
 
 # Embedding Configuration
