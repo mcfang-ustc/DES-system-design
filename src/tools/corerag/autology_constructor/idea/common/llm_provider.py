@@ -3,11 +3,40 @@ from langchain_openai import ChatOpenAI
 from langchain_community.chat_models.tongyi import ChatTongyi
 # from langchain_anthropic import ChatAnthropic
 
+from typing import Any, Dict, Optional
+
 
 try:
     from config.settings import LLM_CONFIG, OPENAI_API_KEY
 except ImportError as e:
     print(f"Error: Could not import configuration from config.settings: {e}. ")
+
+class ReasoningCompatibleChatOpenAI(ChatOpenAI):
+    """
+    ChatOpenAI always includes `temperature` in its request payload.
+
+    OpenAI GPT-5.* models raise an error when `reasoning_effort` is enabled
+    (i.e., not "none") *and* sampling params like `temperature/top_p/logprobs`
+    are present. We therefore strip these fields from the payload whenever
+    reasoning is enabled.
+    """
+
+    @property
+    def _default_params(self) -> Dict[str, Any]:
+        params = super()._default_params
+
+        reasoning_effort = params.get("reasoning_effort")
+        if reasoning_effort is None and hasattr(self, "model_kwargs"):
+            reasoning_effort = (self.model_kwargs or {}).get("reasoning_effort")
+
+        if reasoning_effort is not None and str(reasoning_effort).strip().lower() != "none":
+            # GPT-5.* parameter compatibility: remove unsupported sampling params.
+            params.pop("temperature", None)
+            params.pop("top_p", None)
+            params.pop("logprobs", None)
+            params.pop("top_logprobs", None)
+
+        return params
 
 
 def get_default_llm():
@@ -22,14 +51,33 @@ def get_default_llm():
             openai_api_key_to_use = os.getenv("OPENAI_API_KEY")
             if not openai_api_key_to_use:
                  raise ValueError("OpenAI API Key is not configured in  environment variables.")
-        # Extract openai_api_base if present in config
-        llm_params = {k: v for k, v in LLM_CONFIG.items() if k not in ['model', 'temperature']}
+        # Extract openai_api_base if present in config.
+        # Keep model/temperature as explicit args, and handle OpenAI-only fields
+        # (reasoning_effort/verbosity) via model_kwargs.
+        llm_params = {
+            k: v
+            for k, v in LLM_CONFIG.items()
+            if k not in ['model', 'temperature', 'reasoning_effort', 'verbosity']
+        }
 
         # Rename openai_api_base to base_url for newer ChatOpenAI versions
         if 'openai_api_base' in llm_params:
             llm_params['base_url'] = llm_params.pop('openai_api_base')
 
-        return ChatOpenAI(
+        # OpenAI-only reasoning knobs (safe to ignore for non-OpenAI endpoints)
+        reasoning_effort = LLM_CONFIG.get("reasoning_effort")
+        verbosity = LLM_CONFIG.get("verbosity")
+
+        # Ensure we keep any existing model_kwargs (if provided) and append.
+        model_kwargs: Dict[str, Any] = llm_params.get("model_kwargs") or {}
+        if reasoning_effort is not None:
+            model_kwargs["reasoning_effort"] = reasoning_effort
+        if verbosity is not None:
+            model_kwargs["verbosity"] = verbosity
+        if model_kwargs:
+            llm_params["model_kwargs"] = model_kwargs
+
+        return ReasoningCompatibleChatOpenAI(
             model_name=model_name,
             temperature=temperature,
             openai_api_key=openai_api_key_to_use,

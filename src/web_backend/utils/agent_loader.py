@@ -76,6 +76,8 @@ class AgentLoader:
                 model=llm_config["model"],
                 temperature=llm_config["temperature"],
                 max_tokens=llm_config["max_tokens"],
+                reasoning_effort=llm_config.get("reasoning_effort"),
+                verbosity=llm_config.get("verbosity"),
                 base_url=llm_config.get("api_base")
             )
 
@@ -84,6 +86,8 @@ class AgentLoader:
                 model=agent_llm_config["model"],
                 temperature=agent_llm_config["temperature"],
                 max_tokens=agent_llm_config["max_tokens"],
+                reasoning_effort=agent_llm_config.get("reasoning_effort"),
+                verbosity=agent_llm_config.get("verbosity"),
                 base_url=agent_llm_config.get("api_base")
             )
 

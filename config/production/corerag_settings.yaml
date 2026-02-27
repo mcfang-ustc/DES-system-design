@@ -21,11 +21,14 @@ entity_retrieval:
   min_score_threshold: 0.1
 
 LLM:
-  model: "qwen3-max"
+  model: "gpt-5.2"
   streaming: false
   temperature: 0
   max_tokens: 5000
-  openai_api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  # OpenAI GPT-5.* reasoning controls
+  reasoning_effort: "none"
+  verbosity: "medium"
+  openai_api_base: "https://api.openai.com/v1"
 
 extractor_examples:
   # Docker 容器内路径

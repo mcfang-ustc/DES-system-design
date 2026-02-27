@@ -21,11 +21,16 @@ data:
       min_score_threshold: 0.1
 
     LLM:
-      model: "qwen3-max"
+      model: "gpt-5.2"
       streaming: false
       temperature: 0
       max_tokens: 5000
-      openai_api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+      # OpenAI GPT-5.* reasoning controls
+      # - "none": allows sampling params like temperature
+      # - other values: enable deeper reasoning; temperature/top_p/logprobs will be omitted automatically
+      reasoning_effort: "none"
+      verbosity: "medium"
+      openai_api_base: "https://api.openai.com/v1"
 
     extractor_examples:
       individual_directory_path: "/app/data/extractor_examples/concept/"
@@ -252,7 +257,7 @@ spec:
               mountPath: /app/src/tools/largerag/data
       containers:
         - name: backend
-          image: harbor.pic-aichem.online/sunyk/des-system-design-backend:v0.1.1
+          image: harbor.pic-aichem.online/sunyk/des-system-design-backend:v0.1.2
           imagePullPolicy: Always
           imagePullSecrets: 
             - name: harbor-auth
@@ -277,6 +282,11 @@ spec:
                 secretKeyRef:
                   name: des-secrets
                   key: DASHSCOPE_API_KEY
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: des-secrets
+                  key: OPENAI_API_KEY
           volumeMounts:
             - name: des-data
               mountPath: /app/data
@@ -316,7 +326,7 @@ spec:
             failureThreshold: 3
 
         - name: frontend
-          image: harbor.pic-aichem.online/sunyk/des-system-design-frontend:v0.1.1
+          image: harbor.pic-aichem.online/sunyk/des-system-design-frontend:v0.1.2
           imagePullPolicy: Always
           imagePullSecrets: 
             - name: harbor-auth

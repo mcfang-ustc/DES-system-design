@@ -1372,10 +1372,11 @@ class OntologyAnalyzer:
         else:
             self.settings = ontology_settings
             
-        # Initialize LLM
-        # Ensure OPENAI_API_KEY is loaded if ChatOpenAI relies on it implicitly
-        # from config.settings import OPENAI_API_KEY 
-        self.llm = ChatOpenAI(temperature=0) 
+        # Initialize LLM.
+        # Use the same provider/config as the rest of CoreRAG (and ensure
+        # GPT-5.* reasoning compatibility when enabled).
+        from autology_constructor.idea.common.llm_provider import get_cached_default_llm
+        self.llm = get_cached_default_llm()
         
         # Initialize tools with the determined settings
         self.tools = OntologyTools(self.settings)
