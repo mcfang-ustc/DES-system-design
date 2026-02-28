@@ -9,6 +9,8 @@ Supports:
 
 import os
 import logging
+import re
+import threading
 from typing import Optional, Dict, Any, Iterable
 from openai import OpenAI
 
@@ -90,6 +92,13 @@ class LLMClient:
             base_url=self.base_url
         )
 
+        # Some OpenAI SDK versions (and some OpenAI-compatible vendors) do not
+        # accept newer kwargs (e.g., verbosity) in chat.completions.create.
+        # We learn unsupported parameters at runtime and avoid passing them
+        # again to keep the system resilient in production images.
+        self._unsupported_chat_params: set[str] = set()
+        self._unsupported_chat_params_lock = threading.Lock()
+
         logger.info(
             f"Initialized LLM client: provider={provider}, model={model}, "
             f"temperature={temperature}"
@@ -107,6 +116,28 @@ class LLMClient:
         """Pop keys from dict if present (in-place)."""
         for k in keys:
             d.pop(k, None)
+
+    @staticmethod
+    def _parse_unexpected_kwarg(err: TypeError) -> Optional[str]:
+        """
+        Extract the unexpected kwarg name from typical Python TypeError messages.
+
+        Example:
+            "Completions.create() got an unexpected keyword argument 'verbosity'"
+        """
+        msg = str(err)
+        m = re.search(r"unexpected keyword argument '([^']+)'", msg)
+        if not m:
+            return None
+        return m.group(1)
+
+    def _is_chat_param_unsupported(self, name: str) -> bool:
+        with self._unsupported_chat_params_lock:
+            return name in self._unsupported_chat_params
+
+    def _mark_chat_param_unsupported(self, name: str) -> None:
+        with self._unsupported_chat_params_lock:
+            self._unsupported_chat_params.add(name)
 
     def chat(
         self,
@@ -174,9 +205,11 @@ class LLMClient:
         # Reasoning controls (OpenAI-only)
         if self.provider == "openai":
             if effective_reasoning_effort is not None:
-                params["reasoning_effort"] = effective_reasoning_effort
+                if not self._is_chat_param_unsupported("reasoning_effort"):
+                    params["reasoning_effort"] = effective_reasoning_effort
             if effective_verbosity is not None:
-                params["verbosity"] = effective_verbosity
+                if not self._is_chat_param_unsupported("verbosity"):
+                    params["verbosity"] = effective_verbosity
 
         # Token limit mapping (OpenAI: max_completion_tokens; others: max_tokens)
         effective_max_tokens = self.max_tokens if max_tokens is None else max_tokens
@@ -203,16 +236,38 @@ class LLMClient:
         params.update(kwargs)
 
         # Make API call
-        try:
-            response = self.client.chat.completions.create(**params)
-            content = response.choices[0].message.content
+        request_params: Dict[str, Any] = dict(params)
+        for attempt in range(3):
+            try:
+                response = self.client.chat.completions.create(**request_params)
+                content = response.choices[0].message.content
 
-            logger.debug(f"LLM response: {content[:100]}...")
-            return content
+                logger.debug(f"LLM response: {content[:100]}...")
+                return content
 
-        except Exception as e:
-            logger.error(f"LLM API call failed: {e}")
-            raise
+            except TypeError as e:
+                # Compatibility layer for older OpenAI SDK versions that don't
+                # accept certain kwargs (e.g., 'verbosity').
+                bad = self._parse_unexpected_kwarg(e)
+                if bad and bad in request_params:
+                    self._mark_chat_param_unsupported(bad)
+                    request_params.pop(bad, None)
+                    logger.warning(
+                        "OpenAI SDK does not support chat.completions param '%s' "
+                        "(provider=%s, model=%s). Retrying without it. "
+                        "Fix options: upgrade openai SDK in the image, or set the param to null in config.",
+                        bad,
+                        self.provider,
+                        self.model,
+                    )
+                    continue
+                raise
+
+            except Exception as e:
+                logger.error(f"LLM API call failed: {e}")
+                raise
+
+        raise RuntimeError("LLM call failed after removing unsupported parameters")
 
     def __call__(self, prompt: str, **kwargs) -> str:
         """
