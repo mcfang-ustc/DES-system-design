@@ -60,8 +60,8 @@ reranker:
 
 # ============ LLM 配置 ============
 llm:
-  provider: "dashscope"                         # 固定值
-  model: "qwen-plus"                             # Qwen3-235B
+  provider: "openai"
+  model: "gpt-5.2"
   temperature: 0.1
   max_tokens: 3000
 
