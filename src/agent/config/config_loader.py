@@ -100,7 +100,7 @@ class ConfigLoader:
         Resolve path relative to project root.
 
         Args:
-            path: Relative path string (e.g., "data/memory/des_reasoningbank.json")
+            path: Relative path string (e.g., "data/memory/reasoning_bank.json")
 
         Returns:
             Absolute Path object

@@ -319,7 +319,12 @@ Output JSON:
             if theory:
                 knowledge_state["theory_knowledge"].append(theory)  # Accumulate
                 knowledge_state["num_theory_queries"] += 1
-                tool_calls.append({"tool": "CoreRAG", "query": task["description"], "result": theory})
+                tool_calls.append({
+                    "tool": "CoreRAG",
+                    # Record the *actual* query sent to CoreRAG (LLM-generated), not the task description.
+                    "query": (theory.get("_query_text") if isinstance(theory, dict) else task["description"]),
+                    "result": theory
+                })
             else:
                 knowledge_state["failed_theory_attempts"] += 1  # Track failure
             return {
@@ -334,7 +339,12 @@ Output JSON:
             if literature:
                 knowledge_state["literature_knowledge"].append(literature)  # Accumulate
                 knowledge_state["num_literature_queries"] += 1
-                tool_calls.append({"tool": "LargeRAG", "query": task["description"], "result": literature})
+                tool_calls.append({
+                    "tool": "LargeRAG",
+                    # Record the *actual* query sent to LargeRAG (LLM-generated), not the task description.
+                    "query": (literature.get("_query_text") if isinstance(literature, dict) else task["description"]),
+                    "result": literature
+                })
             else:
                 knowledge_state["failed_literature_attempts"] += 1  # Track failure
             return {
@@ -351,14 +361,22 @@ Output JSON:
             if theory:
                 knowledge_state["theory_knowledge"].append(theory)  # Accumulate
                 knowledge_state["num_theory_queries"] += 1
-                tool_calls.append({"tool": "CoreRAG", "query": task["description"], "result": theory})
+                tool_calls.append({
+                    "tool": "CoreRAG",
+                    "query": (theory.get("_query_text") if isinstance(theory, dict) else task["description"]),
+                    "result": theory
+                })
             else:
                 knowledge_state["failed_theory_attempts"] += 1
 
             if literature:
                 knowledge_state["literature_knowledge"].append(literature)  # Accumulate
                 knowledge_state["num_literature_queries"] += 1
-                tool_calls.append({"tool": "LargeRAG", "query": task["description"], "result": literature})
+                tool_calls.append({
+                    "tool": "LargeRAG",
+                    "query": (literature.get("_query_text") if isinstance(literature, dict) else task["description"]),
+                    "result": literature
+                })
             else:
                 knowledge_state["failed_literature_attempts"] += 1
 
@@ -990,7 +1008,18 @@ Output ONLY the query text (no JSON, no explanation):"""
             result = self.corerag.query(query)
             logger.debug(f"CoreRAG returned: {str(result)[:100]}...")
 
-            return result
+            # Preserve traceability: keep the actual query used alongside the result.
+            if isinstance(result, dict):
+                result.setdefault("_query_text", query_text)
+                result.setdefault("_query_payload", query)
+                return result
+
+            # Defensive fallback: always return a dict-like structure upstream can log.
+            return {
+                "_query_text": query_text,
+                "_query_payload": query,
+                "raw_result": result,
+            }
 
         except Exception as e:
             logger.error(f"CoreRAG query failed: {e}")
@@ -1069,7 +1098,17 @@ Output ONLY the query text (no JSON, no explanation):"""
             result = self.largerag.query(query)
             logger.debug(f"LargeRAG returned: {str(result)[:100]}...")
 
-            return result
+            # Preserve traceability: keep the actual query used alongside the result.
+            if isinstance(result, dict):
+                result.setdefault("_query_text", query_text)
+                result.setdefault("_query_payload", query)
+                return result
+
+            return {
+                "_query_text": query_text,
+                "_query_payload": query,
+                "raw_result": result,
+            }
 
         except Exception as e:
             logger.error(f"LargeRAG query failed: {e}")

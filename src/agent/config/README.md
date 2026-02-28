@@ -104,7 +104,7 @@ memory:
   max_items: 1000  # 记忆库最大容量
   retrieval_top_k: 3  # 每次检索返回的记忆数量
   extraction_max_per_trajectory: 3  # 每个轨迹提取的最大记忆数
-  persist_path: "data/memory/des_reasoningbank.json"
+  persist_path: "data/memory/reasoning_bank.json"
   auto_save: true
 ```
 

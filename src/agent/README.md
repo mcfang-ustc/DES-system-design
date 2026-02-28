@@ -210,7 +210,7 @@ llm:
 memory:
   max_items: 1000
   retrieval_top_k: 3
-  persist_path: "data/memory/des_reasoningbank.json"
+  persist_path: "data/memory/reasoning_bank.json"
   auto_save: true
 
 # Tool Integration

@@ -73,20 +73,43 @@ class ExperimentResult:
         - DES not formed: 0.0
         - DES formed: based on leaching efficiency (higher is better)
 
+        Note:
+        - `measurements[].leaching_efficiency` may be reported in different units
+          (commonly "%" for leaching efficiency, occasionally g/L for solubility-like tasks).
+        - This function returns a *normalized* 0-10 score for UI sorting and comparisons.
+
         Returns:
             float: Performance score (0-10)
         """
         if not self.is_liquid_formed:
             return 0.0
 
-        # Use max leaching_efficiency across measurements, capped at 10
-        efficiencies = [
-            m.get("leaching_efficiency")
-            for m in (self.measurements or [])
+        measurements = self.measurements or []
+        rows = [
+            m for m in measurements
             if m.get("leaching_efficiency") is not None
         ]
-        if efficiencies:
-            return min(10.0, max(efficiencies))
+
+        if rows:
+            max_eff = max(float(m.get("leaching_efficiency")) for m in rows)
+
+            # Heuristic unit handling:
+            # - If unit is percent-like, map 0-100% -> 0-10 (divide by 10).
+            # - Otherwise, keep legacy behavior (cap raw value at 10).
+            unit = ""
+            for m in rows:
+                u = (m.get("unit") or "").strip()
+                if u:
+                    unit = u
+                    break
+
+            unit_norm = unit.lower()
+            is_percent = unit_norm in {"%", "percent", "pct", "percentage"}
+
+            if is_percent:
+                return max(0.0, min(10.0, max_eff / 10.0))
+
+            return max(0.0, min(10.0, max_eff))
 
         # Default to medium score if no efficiency data
         return 5.0

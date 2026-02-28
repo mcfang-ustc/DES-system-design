@@ -41,7 +41,9 @@ memory:
   retrieval_top_k: 3  # Number of memories to retrieve per query
   extraction_max_per_trajectory: 3  # Max memories from single trajectory
   min_similarity: 0.0  # Minimum similarity threshold (0-1)
-  persist_path: "data/memory/des_reasoningbank.json"
+  # Persisted ReasoningBank file. The web backend resolves this relative path
+  # against project root so it lands in the Docker-mounted volume (/app/data).
+  persist_path: "data/memory/reasoning_bank.json"
   auto_save: true  # Auto-save after each consolidation
 
 # Async Experimental Feedback Configuration (NEW)
