@@ -61,7 +61,7 @@ def _to_plain(obj: Any) -> Any:
 class FeedbackService:
     """Service for managing experimental feedback"""
 
-    def __init__(self, max_workers: int = 2):
+    def __init__(self, max_workers: int = 4):
         """
         Initialize feedback service with background processing support.
 

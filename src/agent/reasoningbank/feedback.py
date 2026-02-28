@@ -14,6 +14,8 @@ from pathlib import Path
 from datetime import datetime
 import json
 import logging
+import os
+import threading
 
 from .memory import Trajectory, MemoryItem
 from .extractor import format_experiment_for_llm
@@ -235,24 +237,31 @@ class RecommendationManager:
         self.storage_path = Path(storage_path)
         self.storage_path.mkdir(parents=True, exist_ok=True)
         self.index_file = self.storage_path / "index.json"
+        # Protect index updates + file writes from concurrent access (e.g. async feedback workers).
+        self._lock = threading.RLock()
         self._load_index()
         logger.info(f"Initialized RecommendationManager at {self.storage_path}")
 
     def _load_index(self):
         """Load recommendation index"""
-        if self.index_file.exists():
-            with open(self.index_file, "r", encoding="utf-8") as f:
-                self.index = json.load(f)
-            logger.debug(f"Loaded index with {len(self.index)} entries")
-        else:
-            self.index = {}
-            logger.debug("Created new index")
+        with self._lock:
+            if self.index_file.exists():
+                with open(self.index_file, "r", encoding="utf-8") as f:
+                    self.index = json.load(f)
+                logger.debug(f"Loaded index with {len(self.index)} entries")
+            else:
+                self.index = {}
+                logger.debug("Created new index")
 
     def _save_index(self):
         """Save recommendation index"""
-        with open(self.index_file, "w", encoding="utf-8") as f:
-            json.dump(self.index, f, indent=2, ensure_ascii=False)
-        logger.debug(f"Saved index with {len(self.index)} entries")
+        with self._lock:
+            # Atomic write to avoid partial/corrupted index.json during crashes or concurrent writes.
+            tmp_path = self.index_file.with_suffix(self.index_file.suffix + ".tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(self.index, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, self.index_file)
+            logger.debug(f"Saved index with {len(self.index)} entries")
 
     def _get_formulation_summary(self, formulation: Dict) -> str:
         """
@@ -286,33 +295,36 @@ class RecommendationManager:
         Returns:
             str: Recommendation ID
         """
-        rec_file = self.storage_path / f"{rec.recommendation_id}.json"
+        with self._lock:
+            rec_file = self.storage_path / f"{rec.recommendation_id}.json"
 
-        # Save recommendation
-        with open(rec_file, "w", encoding="utf-8") as f:
-            json.dump(rec.to_dict(), f, indent=2, ensure_ascii=False)
+            # Save recommendation (atomic write)
+            tmp_path = rec_file.with_suffix(rec_file.suffix + ".tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(rec.to_dict(), f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, rec_file)
 
-        # Update index with extended fields for fast list access
-        self.index[rec.recommendation_id] = {
-            "task_id": rec.task_id,
-            "status": rec.status,
-            "created_at": rec.created_at,
-            "updated_at": rec.updated_at,
-            "target_material": rec.task.get("target_material"),
-            "target_temperature": rec.task.get("target_temperature"),
-            # New fields for list view (v2)
-            "formulation_summary": self._get_formulation_summary(rec.formulation),
-            "formulation": rec.formulation,  # Store full formulation dict
-            "confidence": rec.confidence,
-            "performance_score": rec.experiment_result.get_performance_score() if rec.experiment_result else None,
-            "file": str(rec_file),
-        }
-        self._save_index()
+            # Update index with extended fields for fast list access
+            self.index[rec.recommendation_id] = {
+                "task_id": rec.task_id,
+                "status": rec.status,
+                "created_at": rec.created_at,
+                "updated_at": rec.updated_at,
+                "target_material": rec.task.get("target_material"),
+                "target_temperature": rec.task.get("target_temperature"),
+                # New fields for list view (v2)
+                "formulation_summary": self._get_formulation_summary(rec.formulation),
+                "formulation": rec.formulation,  # Store full formulation dict
+                "confidence": rec.confidence,
+                "performance_score": rec.experiment_result.get_performance_score() if rec.experiment_result else None,
+                "file": str(rec_file),
+            }
+            self._save_index()
 
-        logger.info(
-            f"Saved recommendation {rec.recommendation_id} with status {rec.status}"
-        )
-        return rec.recommendation_id
+            logger.info(
+                f"Saved recommendation {rec.recommendation_id} with status {rec.status}"
+            )
+            return rec.recommendation_id
 
     def get_recommendation(self, rec_id: str) -> Optional[Recommendation]:
         """
@@ -324,19 +336,20 @@ class RecommendationManager:
         Returns:
             Recommendation object or None if not found
         """
-        if rec_id not in self.index:
-            logger.warning(f"Recommendation {rec_id} not found in index")
-            return None
+        with self._lock:
+            if rec_id not in self.index:
+                logger.warning(f"Recommendation {rec_id} not found in index")
+                return None
 
-        rec_file = Path(self.index[rec_id]["file"])
-        if not rec_file.exists():
-            logger.error(f"Recommendation file not found: {rec_file}")
-            return None
+            rec_file = Path(self.index[rec_id]["file"])
+            if not rec_file.exists():
+                logger.error(f"Recommendation file not found: {rec_file}")
+                return None
 
-        with open(rec_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            with open(rec_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
 
-        return Recommendation.from_dict(data)
+            return Recommendation.from_dict(data)
 
     def list_recommendations(
         self,
@@ -357,7 +370,10 @@ class RecommendationManager:
         """
         filtered = []
 
-        for rec_id, meta in self.index.items():
+        with self._lock:
+            index_items = list(self.index.items())
+
+        for rec_id, meta in index_items:
             # Apply filters
             if status and meta["status"] != status:
                 continue
@@ -390,15 +406,16 @@ class RecommendationManager:
             rec_id: Recommendation ID
             status: New status (PENDING, COMPLETED, CANCELLED)
         """
-        rec = self.get_recommendation(rec_id)
-        if not rec:
-            raise ValueError(f"Recommendation {rec_id} not found")
+        with self._lock:
+            rec = self.get_recommendation(rec_id)
+            if not rec:
+                raise ValueError(f"Recommendation {rec_id} not found")
 
-        rec.status = status
-        rec.updated_at = datetime.now().isoformat()
-        self.save_recommendation(rec)
+            rec.status = status
+            rec.updated_at = datetime.now().isoformat()
+            self.save_recommendation(rec)
 
-        logger.info(f"Updated {rec_id} status to {status}")
+            logger.info(f"Updated {rec_id} status to {status}")
 
     def submit_feedback(self, rec_id: str, experiment_result: ExperimentResult):
         """
@@ -408,16 +425,17 @@ class RecommendationManager:
             rec_id: Recommendation ID
             experiment_result: ExperimentResult object
         """
-        rec = self.get_recommendation(rec_id)
-        if not rec:
-            raise ValueError(f"Recommendation {rec_id} not found")
+        with self._lock:
+            rec = self.get_recommendation(rec_id)
+            if not rec:
+                raise ValueError(f"Recommendation {rec_id} not found")
 
-        rec.experiment_result = experiment_result
-        rec.status = "COMPLETED"
-        rec.updated_at = datetime.now().isoformat()
+            rec.experiment_result = experiment_result
+            rec.status = "COMPLETED"
+            rec.updated_at = datetime.now().isoformat()
 
-        self.save_recommendation(rec)
-        logger.info(f"Submitted experimental feedback for {rec_id}")
+            self.save_recommendation(rec)
+            logger.info(f"Submitted experimental feedback for {rec_id}")
 
     def get_statistics(self) -> Dict:
         """
@@ -426,18 +444,19 @@ class RecommendationManager:
         Returns:
             Dict with statistics
         """
-        stats = {"total": len(self.index), "by_status": {}, "by_material": {}}
+        with self._lock:
+            stats = {"total": len(self.index), "by_status": {}, "by_material": {}}
 
-        for meta in self.index.values():
-            # Count by status
-            status = meta["status"]
-            stats["by_status"][status] = stats["by_status"].get(status, 0) + 1
+            for meta in self.index.values():
+                # Count by status
+                status = meta["status"]
+                stats["by_status"][status] = stats["by_status"].get(status, 0) + 1
 
-            # Count by material
-            material = meta.get("target_material", "unknown")
-            stats["by_material"][material] = stats["by_material"].get(material, 0) + 1
+                # Count by material
+                material = meta.get("target_material", "unknown")
+                stats["by_material"][material] = stats["by_material"].get(material, 0) + 1
 
-        return stats
+            return stats
 
     def get_statistics_fast(self, material: Optional[str] = None) -> Dict[str, int]:
         """
@@ -458,15 +477,16 @@ class RecommendationManager:
             "CANCELLED": 0
         }
 
-        for rec_id, meta in self.index.items():
-            # Apply material filter if specified
-            if material and meta.get("target_material") != material:
-                continue
+        with self._lock:
+            for rec_id, meta in self.index.items():
+                # Apply material filter if specified
+                if material and meta.get("target_material") != material:
+                    continue
 
-            stats["all"] += 1
-            status = meta["status"]
-            if status in stats:
-                stats[status] += 1
+                stats["all"] += 1
+                status = meta["status"]
+                if status in stats:
+                    stats[status] += 1
 
         logger.debug(f"Fast statistics: {stats} (material={material})")
         return stats
@@ -492,14 +512,15 @@ class RecommendationManager:
         """
         # Filter from index
         filtered = []
-        for rec_id, meta in self.index.items():
-            if status and meta["status"] != status:
-                continue
-            if target_material and meta.get("target_material") != target_material:
-                continue
+        with self._lock:
+            for rec_id, meta in self.index.items():
+                if status and meta["status"] != status:
+                    continue
+                if target_material and meta.get("target_material") != target_material:
+                    continue
 
-            # Add rec_id to meta for response
-            filtered.append({**meta, "recommendation_id": rec_id})
+                # Add rec_id to meta for response
+                filtered.append({**meta, "recommendation_id": rec_id})
 
         # Sort by created_at (descending)
         filtered.sort(key=lambda x: x["created_at"], reverse=True)
