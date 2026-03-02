@@ -277,18 +277,43 @@ class RecommendationService:
                 step_formulation = None
                 if "formulation" in step and step["formulation"]:
                     f = step["formulation"]
-                    step_formulation = FormulationData(
-                        HBD=f.get("HBD", "Unknown"),
-                        HBA=f.get("HBA", "Unknown"),
-                        molar_ratio=f.get("molar_ratio", "Unknown")
-                    )
+                    # Multi-component formulation in a step
+                    if isinstance(f, dict) and f.get("components"):
+                        components = [
+                            ComponentData(
+                                name=comp.get("name", "Unknown"),
+                                role=comp.get("role", "Unknown"),
+                                function=comp.get("function")
+                            )
+                            for comp in (f.get("components") or [])
+                            if isinstance(comp, dict)
+                        ]
+                        step_formulation = FormulationData(
+                            components=components,
+                            num_components=f.get("num_components", len(components)),
+                            molar_ratio=f.get("molar_ratio", "Unknown")
+                        )
+                    else:
+                        # Binary formulation (backward compatible)
+                        step_formulation = FormulationData(
+                            HBD=f.get("HBD", "Unknown") if isinstance(f, dict) else "Unknown",
+                            HBA=f.get("HBA", "Unknown") if isinstance(f, dict) else "Unknown",
+                            molar_ratio=f.get("molar_ratio", "Unknown") if isinstance(f, dict) else "Unknown"
+                        )
 
                 traj_step = TrajectoryStep(
-                    action=step.get("action", "unknown"),
+                    action=step.get("action") or step.get("phase") or "unknown",
                     reasoning=step.get("reasoning", ""),
+                    phase=step.get("phase"),
+                    iteration=step.get("iteration"),
                     tool=step.get("tool"),
                     num_memories=step.get("num_memories"),
-                    formulation=step_formulation
+                    formulation=step_formulation,
+                    result_summary=step.get("result_summary"),
+                    observation=step.get("observation"),
+                    knowledge_updated=step.get("knowledge_updated"),
+                    key_insights=step.get("key_insights"),
+                    information_gaps=step.get("information_gaps"),
                 )
                 trajectory_steps.append(traj_step)
 
