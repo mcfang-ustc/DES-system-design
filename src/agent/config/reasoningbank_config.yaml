@@ -13,9 +13,7 @@ llm:
   max_tokens: 5000
   # OpenAI-only knobs (safe to keep for other providers; they will be ignored)
   # reasoning_effort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
-  reasoning_effort: "none"
-  # verbosity: "low" | "medium" | "high"
-  verbosity: "medium"
+  reasoning_effort: "xhigh"
   api_base: null  # Auto-set by provider. Custom: "https://your-endpoint.com/v1"
 
 # Agent LLM (may use different model for main reasoning)
@@ -27,7 +25,6 @@ agent_llm:
   # Enable GPT-5.2 reasoning. When reasoning_effort != "none", the client will
   # automatically omit incompatible sampling params (temperature/top_p/logprobs).
   reasoning_effort: "xhigh"
-  verbosity: "medium"
 
 # Embedding Configuration
 embedding:
@@ -92,7 +89,7 @@ logging:
 # Agent Behavior (ReAct Loop Configuration)
 agent:
   # ReAct Loop Parameters
-  max_iterations: 5  # Maximum ReAct iterations (Think-Act-Observe cycles)
+  max_iterations: 20  # Maximum ReAct iterations (Think-Act-Observe cycles)
   enable_memory_injection: true  # Inject retrieved memories into prompt
   explain_memory_usage: true  # Agent should explain why it uses each memory
 
