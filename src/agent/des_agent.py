@@ -34,6 +34,12 @@ from .prompts import (
     parse_observe_output
 )
 from .utils.serialization import to_jsonable
+from .utils.json_extract import loads_json_from_text
+from .utils.formulation_validation import (
+    normalize_formulation,
+    validate_formulation,
+    summarize_formulation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -402,11 +408,19 @@ Output JSON:
             )
 
             knowledge_state["formulation_candidates"].append(formulation)
+            diag = formulation.get("_diagnostics") if isinstance(formulation, dict) else None
+            valid = bool(diag.get("validation_ok")) if isinstance(diag, dict) else False
+            formulation_summary = summarize_formulation(
+                (formulation or {}).get("formulation") if isinstance(formulation, dict) else None
+            )
             return {
                 "action": "generate_formulation",
-                "success": True,
+                "success": valid,
                 "data": formulation,
-                "summary": f"Generated formulation: {formulation['formulation'].get('HBD', '?')}:{formulation['formulation'].get('HBA', '?')} (confidence: {formulation.get('confidence', 0):.2f})"
+                "summary": (
+                    f"Generated formulation: {formulation_summary} "
+                    f"(confidence: {(formulation or {}).get('confidence', 0):.2f}, valid={valid})"
+                ),
             }
 
         elif action == "refine_formulation":
@@ -423,11 +437,19 @@ Output JSON:
             )
 
             knowledge_state["formulation_candidates"].append(formulation)
+            diag = formulation.get("_diagnostics") if isinstance(formulation, dict) else None
+            valid = bool(diag.get("validation_ok")) if isinstance(diag, dict) else False
+            formulation_summary = summarize_formulation(
+                (formulation or {}).get("formulation") if isinstance(formulation, dict) else None
+            )
             return {
                 "action": "refine_formulation",
-                "success": True,
+                "success": valid,
                 "data": formulation,
-                "summary": f"Refined formulation (now have {len(knowledge_state['formulation_candidates'])} candidates)"
+                "summary": (
+                    f"Refined formulation: {formulation_summary} "
+                    f"(now have {len(knowledge_state['formulation_candidates'])} candidates, valid={valid})"
+                ),
             }
 
         else:
@@ -776,22 +798,103 @@ Output JSON:
         # ===== Finalize Formulation =====
         logger.info(f"\n[ReAct Agent] Finalizing after {iteration} iterations")
 
-        # If no formulation generated yet, generate now
+        expected_num_components = int(task.get("num_components") or 2)
+
+        # If no formulation generated yet, generate now (and store as candidate #1)
         if not knowledge_state.get("formulation_candidates"):
             logger.info("[Final] Generating formulation from accumulated knowledge")
             if not knowledge_state["memories_retrieved"]:
                 knowledge_state["memories"] = self._retrieve_memories(task)
                 knowledge_state["memories_retrieved"] = True
 
-            formulation_result = self._generate_formulation(
+            cand0 = self._generate_formulation(
                 task,
                 knowledge_state["memories"] or [],
                 knowledge_state["theory_knowledge"],
                 knowledge_state["literature_knowledge"]
             )
+            knowledge_state["formulation_candidates"] = [cand0]
+
+        # Select the best VALID candidate (do not blindly pick [0]).
+        candidate_summaries: List[Dict[str, Any]] = []
+        valid_candidates: List[Tuple[float, int, Dict[str, Any]]] = []
+
+        for idx, cand in enumerate(knowledge_state["formulation_candidates"], start=1):
+            if not isinstance(cand, dict):
+                candidate_summaries.append(
+                    {
+                        "index": idx,
+                        "valid": False,
+                        "confidence": 0.0,
+                        "summary": "<invalid candidate object>",
+                        "errors": ["candidate is not a dict/object"],
+                    }
+                )
+                continue
+
+            f_norm = normalize_formulation(cand.get("formulation"), expected_num_components)
+            ok_f, f_errors = validate_formulation(
+                f_norm, expected_num_components, require_functions=True
+            )
+
+            try:
+                conf = float(cand.get("confidence", 0.0) or 0.0)
+            except Exception:
+                conf = 0.0
+
+            summary = summarize_formulation(f_norm)
+            candidate_summaries.append(
+                {
+                    "index": idx,
+                    "valid": ok_f,
+                    "confidence": conf,
+                    "summary": summary,
+                    "errors": f_errors,
+                }
+            )
+
+            if ok_f:
+                valid_candidates.append((conf, idx, cand))
+
+        selected_candidate_index: Optional[int] = None
+        final_status = "FAILED"
+        outcome = "failed_generation"
+
+        if valid_candidates:
+            # Prefer higher confidence; tie-breaker: later candidate (refinement) wins.
+            _, selected_candidate_index, formulation_result = max(
+                valid_candidates, key=lambda t: (t[0], t[1])
+            )
+            final_status = "PENDING"
+            outcome = "pending_experiment"
         else:
-            # Use best candidate
-            formulation_result = knowledge_state["formulation_candidates"][0]
+            # No valid candidate: persist a FAILED recommendation with diagnostic reasoning.
+            formulation_result = (
+                knowledge_state["formulation_candidates"][-1]
+                if knowledge_state.get("formulation_candidates")
+                else {}
+            )
+            if not isinstance(formulation_result, dict):
+                formulation_result = {}
+
+            # Construct an informative failure message for the UI.
+            fail_lines = [
+                f"No valid {expected_num_components}-component formulation could be produced.",
+                f"Candidates attempted: {len(knowledge_state.get('formulation_candidates') or [])}.",
+            ]
+            for meta in candidate_summaries[-3:]:
+                # Show last few candidates for fast debugging.
+                fail_lines.append(
+                    f"- candidate#{meta.get('index')}: {meta.get('summary')} | "
+                    f"confidence={meta.get('confidence')} | valid={meta.get('valid')} | "
+                    f"errors={meta.get('errors')}"
+                )
+
+            formulation_result = dict(formulation_result)
+            formulation_result.setdefault("formulation", {})
+            formulation_result["confidence"] = 0.0
+            formulation_result["supporting_evidence"] = []
+            formulation_result["reasoning"] = "\n".join(fail_lines)
 
         # Add memories_used to formulation_result for trajectory persistence
         formulation_result["memories_used"] = [m.title for m in (knowledge_state["memories"] or [])]
@@ -801,7 +904,7 @@ Output JSON:
             task_id=task_id,
             task_description=task["description"],
             steps=trajectory_steps,
-            outcome="pending_experiment",
+            outcome=outcome,
             final_result=formulation_result,
             metadata={
                 "target_material": task.get("target_material"),
@@ -810,6 +913,10 @@ Output JSON:
                 "tool_calls": tool_calls,
                 "iterations_used": iteration,
                 "react_mode": True,
+                "expected_num_components": expected_num_components,
+                "candidate_summaries": candidate_summaries,
+                "selected_candidate_index": selected_candidate_index,
+                "final_status": final_status,
                 "final_knowledge_state": {
                     "had_memories": knowledge_state["memories_retrieved"],
                     "had_theory": len(knowledge_state["theory_knowledge"]) > 0,
@@ -827,11 +934,11 @@ Output JSON:
             recommendation_id=rec_id,
             task=task,
             task_id=task_id,
-            formulation=formulation_result["formulation"],
+            formulation=formulation_result.get("formulation", {}),
             reasoning=formulation_result.get("reasoning", ""),
             confidence=formulation_result.get("confidence", 0.0),
             trajectory=trajectory,
-            status="PENDING",
+            status=final_status,
             created_at=datetime.now().isoformat(),
             updated_at=datetime.now().isoformat()
         )
@@ -842,7 +949,7 @@ Output JSON:
         # ===== Prepare Return Result =====
         result = formulation_result.copy()
         result["recommendation_id"] = rec_id
-        result["status"] = "PENDING"
+        result["status"] = final_status
         result["task_id"] = task_id
         result["iterations_used"] = iteration
         result["memories_used"] = [m.title for m in (knowledge_state["memories"] or [])]
@@ -851,10 +958,16 @@ Output JSON:
             "theory": len(knowledge_state["theory_knowledge"]) > 0,
             "literature": len(knowledge_state["literature_knowledge"]) > 0
         }
-        result["next_steps"] = (
-            f"Recommendation {rec_id} is ready for experimental testing. "
-            f"Submit feedback using agent.submit_experiment_feedback('{rec_id}', experiment_result)."
-        )
+        if final_status == "PENDING":
+            result["next_steps"] = (
+                f"Recommendation {rec_id} is ready for experimental testing. "
+                f"Submit feedback using agent.submit_experiment_feedback('{rec_id}', experiment_result)."
+            )
+        else:
+            result["next_steps"] = (
+                f"Recommendation {rec_id} failed to generate a valid formulation. "
+                f"Review the failure reasoning and retry generation (or adjust prompt/config)."
+            )
 
         logger.info(f"[ReAct Agent] Task {task_id} completed in {iteration} iterations")
         return result
@@ -1137,23 +1250,321 @@ Output ONLY the query text (no JSON, no explanation):"""
         # Build comprehensive prompt
         prompt = self._build_formulation_prompt(task, memories, theory_list, literature_list)
 
-        # Call LLM
-        try:
-            llm_output = self.llm_client(prompt)
-            logger.debug(f"LLM formulation output: {llm_output[:200]}...")
-        except Exception as e:
-            logger.error(f"LLM call failed: {e}")
+        expected_num_components = int(task.get("num_components") or 2)
+
+        # Prefer OpenAI's official structured outputs when available (Chat Completions response_format).
+        response_format = None
+        if getattr(self.llm_client, "provider", None) == "openai":
+            response_format = self._build_formulation_response_format(expected_num_components)
+            if response_format is not None:
+                logger.info(
+                    "[Formulation] Using OpenAI response_format=json_schema strict for structured output "
+                    "(num_components=%s).",
+                    expected_num_components,
+                )
+
+        diagnostics = {
+            "expected_num_components": expected_num_components,
+            "used_response_format": bool(response_format),
+            "repair_used": False,
+            "parse_ok": False,
+            "validation_ok": False,
+            # Fatal validation errors (blocks persistence as PENDING)
+            "validation_errors": [],
+            # Non-fatal normalization notes (kept for debugging)
+            "notes": [],
+            # Keep raw outputs for debugging; do NOT delete tool objects elsewhere.
+            "raw_outputs": [],
+        }
+
+        def _attempt(llm_prompt: str) -> Dict:
+            """One LLM attempt + parse/normalize/validate."""
+            try:
+                if response_format is not None:
+                    llm_output = self.llm_client(llm_prompt, response_format=response_format)
+                else:
+                    llm_output = self.llm_client(llm_prompt)
+                llm_output = llm_output or ""
+                diagnostics["raw_outputs"].append(llm_output)
+                logger.debug(f"LLM formulation output: {llm_output[:200]}...")
+            except Exception as e:
+                logger.error(f"LLM call failed: {e}")
+                return {
+                    "candidate": None,
+                    "fatal_errors": [f"LLM call failed: {str(e)}"],
+                    "notes": [],
+                }
+
+            parsed = loads_json_from_text(llm_output)
+            if not isinstance(parsed, dict):
+                return {
+                    "candidate": None,
+                    "fatal_errors": ["Could not parse a JSON object from LLM output"],
+                    "notes": [],
+                }
+
+            cand: Dict = dict(parsed)
+            cand.setdefault("formulation", {})
+            cand.setdefault("reasoning", "")
+            cand.setdefault("confidence", 0.0)
+            cand.setdefault("supporting_evidence", [])
+
+            # Normalize types for downstream UI/persistence.
+            cand["formulation"] = normalize_formulation(
+                cand.get("formulation"), expected_num_components
+            )
+            if expected_num_components != 2:
+                cand.setdefault("synergy_explanation", "")
+
+            fatal_errors: List[str] = []
+            notes: List[str] = []
+
+            # Validate formulation structure (fixed component count).
+            ok_form, form_errors = validate_formulation(
+                cand["formulation"], expected_num_components, require_functions=True
+            )
+            if not ok_form:
+                fatal_errors.extend(form_errors)
+
+            # Validate confidence
+            try:
+                cand["confidence"] = float(cand.get("confidence", 0.0))
+            except Exception:
+                cand["confidence"] = 0.0
+                notes.append("confidence must be a number (normalized to 0.0)")
+            if not (0.0 <= float(cand["confidence"]) <= 1.0):
+                notes.append("confidence must be between 0.0 and 1.0 (clamped)")
+                cand["confidence"] = max(0.0, min(1.0, float(cand["confidence"])))
+
+            # Validate reasoning (research-grade: don't allow empty)
+            if not isinstance(cand.get("reasoning"), str) or not cand["reasoning"].strip():
+                fatal_errors.append("missing/empty reasoning")
+                cand["reasoning"] = str(cand.get("reasoning") or "").strip()
+
+            # Multi-component: require synergy explanation
+            if expected_num_components != 2:
+                if (
+                    not isinstance(cand.get("synergy_explanation"), str)
+                    or not cand["synergy_explanation"].strip()
+                ):
+                    fatal_errors.append("missing/empty synergy_explanation")
+                    cand["synergy_explanation"] = str(
+                        cand.get("synergy_explanation") or ""
+                    ).strip()
+
+            # Normalize supporting_evidence to a list[str]
+            ev = cand.get("supporting_evidence")
+            if ev is None:
+                cand["supporting_evidence"] = []
+            elif not isinstance(ev, list):
+                cand["supporting_evidence"] = [str(ev)]
+                notes.append("supporting_evidence must be a list (normalized)")
+            else:
+                cand["supporting_evidence"] = [str(x) for x in ev if x is not None]
+
+            return {"candidate": cand, "fatal_errors": fatal_errors, "notes": notes}
+
+        # Attempt 1
+        attempt1 = _attempt(prompt)
+        cand = attempt1["candidate"]
+        fatal_errors = attempt1.get("fatal_errors") or []
+        notes = attempt1.get("notes") or []
+
+        # Auto-repair once if parse/validation failed.
+        if cand is None or fatal_errors:
+            diagnostics["repair_used"] = True
+            repair_prompt = self._build_formulation_repair_prompt(
+                task=task,
+                expected_num_components=expected_num_components,
+                previous_output=(diagnostics["raw_outputs"][-1] if diagnostics["raw_outputs"] else ""),
+                errors=(fatal_errors or ["unparseable JSON output"]),
+            )
+            attempt2 = _attempt(repair_prompt)
+            cand2 = attempt2["candidate"]
+            fatal_errors2 = attempt2.get("fatal_errors") or []
+            notes2 = attempt2.get("notes") or []
+
+            # Keep the repaired candidate even if still invalid (for debugging),
+            # but record validation status accurately.
+            if cand2 is not None:
+                cand = cand2
+            fatal_errors = fatal_errors2
+            notes = notes2
+
+        diagnostics["parse_ok"] = cand is not None
+        diagnostics["validation_ok"] = bool(cand is not None and not fatal_errors)
+        diagnostics["validation_errors"] = fatal_errors
+        diagnostics["notes"] = notes
+
+        if cand is None:
+            # Total failure: no JSON to persist.
             return {
                 "formulation": {},
-                "reasoning": f"Error: {str(e)}",
+                "reasoning": "Formulation generation failed: no JSON output could be parsed.",
                 "confidence": 0.0,
-                "supporting_evidence": []
+                "supporting_evidence": [],
+                "_diagnostics": diagnostics,
             }
 
-        # Parse LLM output
-        result = self._parse_formulation_output(llm_output)
+        # Attach diagnostics (kept out of the prompt; safe for persistence).
+        cand["_diagnostics"] = diagnostics
+        return cand
 
-        return result
+    def _build_formulation_response_format(self, expected_num_components: int) -> Optional[Dict[str, Any]]:
+        """
+        Build OpenAI Chat Completions `response_format` for structured outputs.
+
+        Notes:
+        - We keep the schema intentionally simple (supported subset) so it works
+          across OpenAI-compatible deployments.
+        - Even with strict schema, we still validate locally before persisting.
+        """
+        if expected_num_components < 2:
+            return None
+
+        if expected_num_components == 2:
+            schema = {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "formulation": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "HBD": {"type": "string"},
+                            "HBA": {"type": "string"},
+                            "molar_ratio": {"type": "string"},
+                        },
+                        "required": ["HBD", "HBA", "molar_ratio"],
+                    },
+                    "reasoning": {"type": "string"},
+                    "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "supporting_evidence": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["formulation", "reasoning", "confidence", "supporting_evidence"],
+            }
+        else:
+            component_item = {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "name": {"type": "string"},
+                    "role": {"type": "string"},
+                    "function": {"type": "string"},
+                },
+                "required": ["name", "role", "function"],
+            }
+
+            schema = {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "formulation": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "components": {
+                                "type": "array",
+                                "items": component_item,
+                                "minItems": expected_num_components,
+                                "maxItems": expected_num_components,
+                            },
+                            "molar_ratio": {"type": "string"},
+                            "num_components": {"type": "integer"},
+                        },
+                        "required": ["components", "molar_ratio", "num_components"],
+                    },
+                    "reasoning": {"type": "string"},
+                    "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "supporting_evidence": {"type": "array", "items": {"type": "string"}},
+                    "synergy_explanation": {"type": "string"},
+                },
+                "required": [
+                    "formulation",
+                    "reasoning",
+                    "confidence",
+                    "supporting_evidence",
+                    "synergy_explanation",
+                ],
+            }
+
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "des_formulation_v1",
+                "strict": True,
+                "schema": schema,
+            },
+        }
+
+    def _build_formulation_repair_prompt(
+        self,
+        *,
+        task: Dict,
+        expected_num_components: int,
+        previous_output: str,
+        errors: List[str],
+    ) -> str:
+        """
+        Repair prompt that converts a non-JSON/invalid output into valid JSON.
+
+        We intentionally keep this repair prompt small: it should reformat the
+        model's *previous* answer instead of re-querying all tool context.
+        """
+        if expected_num_components == 2:
+            schema_hint = (
+                "Return JSON with keys: formulation(HBD,HBA,molar_ratio), reasoning, confidence, supporting_evidence.\n"
+                "Template:\n"
+                '{"formulation":{"HBD":"...","HBA":"...","molar_ratio":"..."},"reasoning":"...","confidence":0.0,"supporting_evidence":["..."]}\n'
+            )
+        else:
+            ratio_example = ":".join(["1"] * expected_num_components)
+            component_lines: List[str] = []
+            for i in range(1, expected_num_components + 1):
+                comma = "," if i < expected_num_components else ""
+                component_lines.append(
+                    f'      {{"name": "Component {i}", "role": "HBD/HBA/neutral", "function": "..."}}{comma}'
+                )
+            components_block = "\n".join(component_lines)
+            schema_hint = (
+                f"- Must be exactly {expected_num_components} components.\n"
+                f"- molar_ratio must have {expected_num_components - 1} ':' separators.\n"
+                "Return JSON with keys: formulation(components,molar_ratio,num_components), reasoning, confidence, supporting_evidence, synergy_explanation.\n"
+                "Template:\n"
+                "{\n"
+                '  "formulation": {\n'
+                '    "components": [\n'
+                f"{components_block}\n"
+                "    ],\n"
+                f'    "molar_ratio": "{ratio_example}",\n'
+                f'    "num_components": {expected_num_components}\n'
+                "  },\n"
+                '  "reasoning": "...",\n'
+                '  "confidence": 0.0,\n'
+                '  "supporting_evidence": ["..."],\n'
+                '  "synergy_explanation": "..." \n'
+                "}\n"
+            )
+
+        err_text = "\n".join(f"- {e}" for e in (errors or [])[:12])
+        return f"""You previously generated an answer for a DES formulation task, but it did not meet the required JSON schema.
+
+Task:
+- description: {task.get('description')}
+- target_material: {task.get('target_material')}
+- target_temperature_C: {task.get('target_temperature', 25)}
+- num_components: {expected_num_components}
+
+Errors detected:
+{err_text}
+
+Requirements:
+{schema_hint}Return ONLY a JSON object that matches the schema from the instructions in the previous prompt.
+Do NOT include markdown fences. Do NOT include any extra text outside the JSON.
+
+Your previous output:
+{previous_output}
+"""
 
     def _build_formulation_prompt(
         self,

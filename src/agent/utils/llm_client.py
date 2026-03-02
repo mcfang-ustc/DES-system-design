@@ -147,6 +147,7 @@ class LLMClient:
         max_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
         verbosity: Optional[str] = None,
+        response_format: Optional[Dict[str, Any]] = None,
         **kwargs
     ) -> str:
         """
@@ -182,6 +183,7 @@ class LLMClient:
             else self.reasoning_effort
         )
         effective_verbosity = verbosity if verbosity is not None else self.verbosity
+        effective_response_format = response_format
 
         # Prevent accidental overrides via **kwargs
         reserved = {
@@ -192,6 +194,7 @@ class LLMClient:
             "max_completion_tokens",
             "reasoning_effort",
             "verbosity",
+            "response_format",
         }
         if any(k in kwargs for k in reserved):
             logger.warning(
@@ -210,6 +213,9 @@ class LLMClient:
             if effective_verbosity is not None:
                 if not self._is_chat_param_unsupported("verbosity"):
                     params["verbosity"] = effective_verbosity
+            if effective_response_format is not None:
+                if not self._is_chat_param_unsupported("response_format"):
+                    params["response_format"] = effective_response_format
 
         # Token limit mapping (OpenAI: max_completion_tokens; others: max_tokens)
         effective_max_tokens = self.max_tokens if max_tokens is None else max_tokens
@@ -240,7 +246,7 @@ class LLMClient:
         for attempt in range(3):
             try:
                 response = self.client.chat.completions.create(**request_params)
-                content = response.choices[0].message.content
+                content = response.choices[0].message.content or ""
 
                 logger.debug(f"LLM response: {content[:100]}...")
                 return content
@@ -264,6 +270,26 @@ class LLMClient:
                 raise
 
             except Exception as e:
+                # Some SDK versions / proxies reject newer parameters via HTTP 400
+                # (instead of a Python TypeError). Retry once by removing the
+                # offending param so production doesn't hard-fail.
+                msg = str(e)
+                if (
+                    self.provider == "openai"
+                    and "response_format" in request_params
+                    and ("response_format" in msg or "json_schema" in msg or "json_object" in msg)
+                ):
+                    self._mark_chat_param_unsupported("response_format")
+                    request_params.pop("response_format", None)
+                    logger.warning(
+                        "OpenAI API rejected response_format (provider=%s, model=%s). "
+                        "Retrying without it. Error: %s",
+                        self.provider,
+                        self.model,
+                        msg[:300],
+                    )
+                    continue
+
                 logger.error(f"LLM API call failed: {e}")
                 raise
 
