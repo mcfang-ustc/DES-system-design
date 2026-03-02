@@ -5,7 +5,7 @@ This module implements the main agent for DES formulation design,
 integrating ReasoningBank memory system with CoreRAG and LargeRAG tools.
 """
 
-from typing import Dict, List, Optional, Callable, Tuple
+from typing import Dict, List, Optional, Callable, Tuple, Any
 import logging
 from datetime import datetime
 import asyncio
@@ -33,6 +33,7 @@ from .prompts import (
     format_action_result_for_observe,
     parse_observe_output
 )
+from .utils.serialization import to_jsonable
 
 logger = logging.getLogger(__name__)
 
@@ -1195,13 +1196,13 @@ Output ONLY the query text (no JSON, no explanation):"""
         if theory_list:
             prompt += f"## Theoretical Knowledge (from CoreRAG - {len(theory_list)} queries)\n\n"
             for i, theory in enumerate(theory_list, 1):
-                prompt += f"### Theory Query {i}:\n{theory}\n\n"
+                prompt += f"### Theory Query {i}\n{self._format_corerag_for_prompt(theory)}\n\n"
 
         # Add all accumulated literature knowledge
         if literature_list:
             prompt += f"## Literature Precedents (from LargeRAG - {len(literature_list)} queries)\n\n"
             for i, literature in enumerate(literature_list, 1):
-                prompt += f"### Literature Query {i}:\n{literature}\n\n"
+                prompt += f"### Literature Query {i}\n{self._format_largerag_for_prompt(literature)}\n\n"
 
         # Instructions - Support both binary and multi-component DES
         num_components = task.get("num_components", 2)  # Default to binary (2-component) DES
@@ -1274,6 +1275,123 @@ Format your response as JSON:
 
 
         return prompt
+
+    def _format_corerag_for_prompt(self, theory: Any) -> str:
+        """
+        Convert CoreRAG output into a prompt-friendly, information-dense text block.
+
+        Rationale:
+        - CoreRAG may return large nested dicts. Dumping raw dicts bloats context and
+          hurts LLM performance.
+        - CoreRAG already produces a high-quality formatted report schema
+          (summary/key_points/background_information/relationships). Prefer that.
+        """
+        if not theory:
+            return "(No CoreRAG result)"
+
+        if not isinstance(theory, dict):
+            # Defensive fallback (keep information; never crash prompt build)
+            return str(theory)
+
+        query_text = (theory.get("_query_text") or theory.get("query") or "").strip()
+        summary = (theory.get("summary") or "").strip()
+        key_points = theory.get("key_points") or []
+        background = theory.get("background_information") or []
+        relationships = theory.get("relationships") or []
+
+        parts: List[str] = []
+        if query_text:
+            parts.append(f"Query: {query_text}")
+        if summary:
+            parts.append(f"Summary: {summary}")
+
+        if key_points:
+            parts.append("Key Points:")
+            for p in key_points:
+                if p:
+                    parts.append(f"- {p}")
+
+        if background:
+            parts.append("Background Information:")
+            for b in background:
+                if b:
+                    parts.append(f"- {b}")
+
+        if relationships:
+            parts.append("Relationships:")
+            for r in relationships:
+                if r:
+                    parts.append(f"- {r}")
+
+        if parts:
+            return "\n".join(parts).strip()
+
+        # Last resort: stable JSON pretty-print with string fallback for unknown objects.
+        try:
+            return json.dumps(to_jsonable(theory), ensure_ascii=False, indent=2)
+        except Exception:
+            return str(theory)
+
+    def _format_largerag_for_prompt(self, literature: Any) -> str:
+        """
+        Convert LargeRAG output into a prompt-friendly text block.
+
+        Rationale:
+        - LargeRAG returns `documents` which may contain long page texts.
+          Dumping the raw dict often exceeds LLM context limits.
+        - Prefer `formatted_text` which is already truncated and readable.
+        """
+        if not literature:
+            return "(No LargeRAG result)"
+
+        if not isinstance(literature, dict):
+            return str(literature)
+
+        query_text = (literature.get("_query_text") or literature.get("query") or "").strip()
+        formatted_text = literature.get("formatted_text")
+        if isinstance(formatted_text, str) and formatted_text.strip():
+            if query_text:
+                return f"Query: {query_text}\n\n{formatted_text.strip()}"
+            return formatted_text.strip()
+
+        # Fallback: format documents but NEVER include full unbounded text.
+        documents = literature.get("documents") or []
+        if isinstance(documents, list) and documents:
+            parts: List[str] = []
+            if query_text:
+                parts.append(f"Query: {query_text}")
+                parts.append("")
+
+            for i, doc in enumerate(documents, 1):
+                if not isinstance(doc, dict):
+                    parts.append(f"Document {i}: {str(doc)}")
+                    continue
+
+                meta = doc.get("metadata") or {}
+                if not isinstance(meta, dict):
+                    meta = {}
+
+                doc_hash = str(meta.get("doc_hash", "unknown"))[:8]
+                page = meta.get("page_idx", "N/A")
+                score = doc.get("score", 0.0)
+
+                text = doc.get("text", "")
+                if not isinstance(text, str):
+                    text = str(text)
+                if len(text) > 600:
+                    text = text[:600] + "..."
+
+                parts.append(
+                    f"Document {i} (Score: {float(score):.3f}, Source: {doc_hash}..., Page: {page}):\n{text}"
+                )
+
+            return "\n\n---\n\n".join(parts).strip()
+
+        # Last resort: stable JSON pretty-print
+        try:
+            return json.dumps(to_jsonable(literature), ensure_ascii=False, indent=2)
+        except Exception:
+            return str(literature)
 
     def _parse_formulation_output(self, llm_output: str) -> Dict:
         """
