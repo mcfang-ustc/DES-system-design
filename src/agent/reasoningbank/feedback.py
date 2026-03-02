@@ -19,6 +19,7 @@ import threading
 
 from .memory import Trajectory, MemoryItem
 from .extractor import format_experiment_for_llm
+from ..utils.serialization import to_jsonable
 
 logger = logging.getLogger(__name__)
 
@@ -173,14 +174,33 @@ class Recommendation:
     metadata: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        """Convert to dictionary for serialization"""
-        data = asdict(self)
-        # Special handling for Trajectory
-        data["trajectory"] = self.trajectory.to_dict()
-        # Special handling for ExperimentResult
-        if self.experiment_result:
-            data["experiment_result"] = self.experiment_result.to_dict()
-        return data
+        """
+        Convert to a JSON-safe dictionary for persistence.
+
+        NOTE:
+        - We intentionally avoid dataclasses.asdict(self) because it uses
+          copy.deepcopy() internally. CoreRAG (owlready2) may place objects
+          such as LogicalClassConstruct into tool results, which are not
+          deepcopy()-safe and would crash save_recommendation().
+        - We keep structure where possible and stringify unknown objects.
+        """
+        return {
+            "recommendation_id": self.recommendation_id,
+            "task": to_jsonable(self.task),
+            "task_id": self.task_id,
+            "formulation": to_jsonable(self.formulation),
+            "reasoning": self.reasoning,
+            "confidence": self.confidence,
+            "trajectory": self.trajectory.to_dict(),
+            "status": self.status,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "experiment_result": (
+                self.experiment_result.to_dict() if self.experiment_result else None
+            ),
+            "version": self.version,
+            "metadata": to_jsonable(self.metadata),
+        }
 
     @classmethod
     def from_dict(cls, data: dict) -> "Recommendation":
