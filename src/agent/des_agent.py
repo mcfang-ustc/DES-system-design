@@ -1252,11 +1252,22 @@ Output ONLY the query text (no JSON, no explanation):"""
 
         expected_num_components = int(task.get("num_components") or 2)
 
-        # Prefer OpenAI's official structured outputs when available (Chat Completions response_format).
+        # Prefer OpenAI's official structured outputs when available.
+        # Priority:
+        # 1) Function calling with strict schema (best for schema compliance)
+        # 2) Chat Completions response_format=json_schema strict (fallback)
+        tool_spec: Optional[Tuple[List[Dict[str, Any]], Any, str]] = None
         response_format = None
         if getattr(self.llm_client, "provider", None) == "openai":
+            tool_spec = self._build_formulation_tool_spec(expected_num_components)
             response_format = self._build_formulation_response_format(expected_num_components)
-            if response_format is not None:
+            if tool_spec is not None:
+                logger.info(
+                    "[Formulation] Using OpenAI function calling strict for structured output "
+                    "(num_components=%s).",
+                    expected_num_components,
+                )
+            elif response_format is not None:
                 logger.info(
                     "[Formulation] Using OpenAI response_format=json_schema strict for structured output "
                     "(num_components=%s).",
@@ -1265,7 +1276,12 @@ Output ONLY the query text (no JSON, no explanation):"""
 
         diagnostics = {
             "expected_num_components": expected_num_components,
-            "used_response_format": bool(response_format),
+            "requested_tool_call": bool(tool_spec),
+            "used_tool_call": False,
+            "tool_name": (tool_spec[2] if tool_spec is not None else None),
+            "requested_response_format": bool(response_format),
+            "used_response_format": False,
+            "strategy_used": None,
             "repair_used": False,
             "parse_ok": False,
             "validation_ok": False,
@@ -1275,17 +1291,82 @@ Output ONLY the query text (no JSON, no explanation):"""
             "notes": [],
             # Keep raw outputs for debugging; do NOT delete tool objects elsewhere.
             "raw_outputs": [],
+            "raw_tool_calls": [],
         }
 
-        def _attempt(llm_prompt: str) -> Dict:
+        def _parse_tool_call_json(tool_calls: Any, fn_name: str) -> Optional[Dict[str, Any]]:
+            """
+            Extract JSON object from tool call arguments for the expected function.
+
+            We expect a single function call. If multiple are present, prefer
+            the first matching name.
+            """
+            if not tool_calls or not isinstance(tool_calls, list):
+                return None
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function")
+                if not isinstance(fn, dict):
+                    continue
+                if fn.get("name") != fn_name:
+                    continue
+                args = fn.get("arguments")
+                if isinstance(args, dict):
+                    return dict(args)
+                if isinstance(args, str) and args.strip():
+                    try:
+                        parsed = json.loads(args)
+                        if isinstance(parsed, dict):
+                            return parsed
+                    except Exception:
+                        # Fall back to best-effort JSON extraction.
+                        parsed = loads_json_from_text(args)
+                        if isinstance(parsed, dict):
+                            return parsed
+            return None
+
+        def _attempt(llm_prompt: str, *, strategy: str) -> Dict:
             """One LLM attempt + parse/normalize/validate."""
             try:
-                if response_format is not None:
+                diagnostics["strategy_used"] = strategy
+
+                if strategy == "tool_call" and tool_spec is not None:
+                    tools, tool_choice, fn_name = tool_spec
+                    # NOTE: We must call .chat() directly to receive tool_calls.
+                    resp = self.llm_client.chat(  # type: ignore[attr-defined]
+                        llm_prompt,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        parallel_tool_calls=False,
+                        return_tool_calls=True,
+                    )
+                    llm_output = str((resp or {}).get("content") or "")
+                    tool_calls = (resp or {}).get("tool_calls")
+                    diagnostics["raw_outputs"].append(llm_output)
+                    diagnostics["raw_tool_calls"].append(tool_calls)
+                    parsed = _parse_tool_call_json(tool_calls, fn_name)
+                    if parsed is None:
+                        return {
+                            "candidate": None,
+                            "fatal_errors": [
+                                "Missing/invalid tool call arguments (structured output not produced)"
+                            ],
+                            "notes": [],
+                        }
+                    diagnostics["used_tool_call"] = True
+                elif strategy == "response_format" and response_format is not None:
                     llm_output = self.llm_client(llm_prompt, response_format=response_format)
+                    llm_output = llm_output or ""
+                    diagnostics["raw_outputs"].append(llm_output)
+                    diagnostics["used_response_format"] = True
+                    parsed = loads_json_from_text(llm_output)
                 else:
                     llm_output = self.llm_client(llm_prompt)
-                llm_output = llm_output or ""
-                diagnostics["raw_outputs"].append(llm_output)
+                    llm_output = llm_output or ""
+                    diagnostics["raw_outputs"].append(llm_output)
+                    parsed = loads_json_from_text(llm_output)
+
                 logger.debug(f"LLM formulation output: {llm_output[:200]}...")
             except Exception as e:
                 logger.error(f"LLM call failed: {e}")
@@ -1295,7 +1376,6 @@ Output ONLY the query text (no JSON, no explanation):"""
                     "notes": [],
                 }
 
-            parsed = loads_json_from_text(llm_output)
             if not isinstance(parsed, dict):
                 return {
                     "candidate": None,
@@ -1364,22 +1444,30 @@ Output ONLY the query text (no JSON, no explanation):"""
 
             return {"candidate": cand, "fatal_errors": fatal_errors, "notes": notes}
 
+        primary_strategy = "tool_call" if tool_spec is not None else ("response_format" if response_format is not None else "text")
+
         # Attempt 1
-        attempt1 = _attempt(prompt)
+        attempt1 = _attempt(prompt, strategy=primary_strategy)
         cand = attempt1["candidate"]
         fatal_errors = attempt1.get("fatal_errors") or []
         notes = attempt1.get("notes") or []
 
         # Auto-repair once if parse/validation failed.
         if cand is None or fatal_errors:
-            diagnostics["repair_used"] = True
-            repair_prompt = self._build_formulation_repair_prompt(
-                task=task,
-                expected_num_components=expected_num_components,
-                previous_output=(diagnostics["raw_outputs"][-1] if diagnostics["raw_outputs"] else ""),
-                errors=(fatal_errors or ["unparseable JSON output"]),
-            )
-            attempt2 = _attempt(repair_prompt)
+            # If tool calling did not produce any structured output (e.g. tools unsupported
+            # by SDK/proxy), fall back to response_format (if available) using the full prompt.
+            if primary_strategy == "tool_call" and not diagnostics.get("used_tool_call"):
+                secondary = "response_format" if response_format is not None else "text"
+                attempt2 = _attempt(prompt, strategy=secondary)
+            else:
+                diagnostics["repair_used"] = True
+                repair_prompt = self._build_formulation_repair_prompt(
+                    task=task,
+                    expected_num_components=expected_num_components,
+                    previous_output=(diagnostics["raw_outputs"][-1] if diagnostics["raw_outputs"] else ""),
+                    errors=(fatal_errors or ["unparseable JSON output"]),
+                )
+                attempt2 = _attempt(repair_prompt, strategy=primary_strategy)
             cand2 = attempt2["candidate"]
             fatal_errors2 = attempt2.get("fatal_errors") or []
             notes2 = attempt2.get("notes") or []
@@ -1410,20 +1498,15 @@ Output ONLY the query text (no JSON, no explanation):"""
         cand["_diagnostics"] = diagnostics
         return cand
 
-    def _build_formulation_response_format(self, expected_num_components: int) -> Optional[Dict[str, Any]]:
-        """
-        Build OpenAI Chat Completions `response_format` for structured outputs.
-
-        Notes:
-        - We keep the schema intentionally simple (supported subset) so it works
-          across OpenAI-compatible deployments.
-        - Even with strict schema, we still validate locally before persisting.
-        """
+    def _build_formulation_parameters_schema(
+        self, expected_num_components: int
+    ) -> Optional[Dict[str, Any]]:
+        """Build a JSON Schema for the formulation output object."""
         if expected_num_components < 2:
             return None
 
         if expected_num_components == 2:
-            schema = {
+            return {
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
@@ -1443,50 +1526,94 @@ Output ONLY the query text (no JSON, no explanation):"""
                 },
                 "required": ["formulation", "reasoning", "confidence", "supporting_evidence"],
             }
-        else:
-            component_item = {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "name": {"type": "string"},
-                    "role": {"type": "string"},
-                    "function": {"type": "string"},
-                },
-                "required": ["name", "role", "function"],
-            }
 
-            schema = {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "formulation": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "components": {
-                                "type": "array",
-                                "items": component_item,
-                                "minItems": expected_num_components,
-                                "maxItems": expected_num_components,
-                            },
-                            "molar_ratio": {"type": "string"},
-                            "num_components": {"type": "integer"},
+        component_item = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "name": {"type": "string"},
+                "role": {"type": "string"},
+                "function": {"type": "string"},
+            },
+            "required": ["name", "role", "function"],
+        }
+
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "formulation": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "components": {
+                            "type": "array",
+                            "items": component_item,
+                            "minItems": expected_num_components,
+                            "maxItems": expected_num_components,
                         },
-                        "required": ["components", "molar_ratio", "num_components"],
+                        "molar_ratio": {"type": "string"},
+                        "num_components": {"type": "integer"},
                     },
-                    "reasoning": {"type": "string"},
-                    "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                    "supporting_evidence": {"type": "array", "items": {"type": "string"}},
-                    "synergy_explanation": {"type": "string"},
+                    "required": ["components", "molar_ratio", "num_components"],
                 },
-                "required": [
-                    "formulation",
-                    "reasoning",
-                    "confidence",
-                    "supporting_evidence",
-                    "synergy_explanation",
-                ],
+                "reasoning": {"type": "string"},
+                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "supporting_evidence": {"type": "array", "items": {"type": "string"}},
+                "synergy_explanation": {"type": "string"},
+            },
+            "required": [
+                "formulation",
+                "reasoning",
+                "confidence",
+                "supporting_evidence",
+                "synergy_explanation",
+            ],
+        }
+
+    def _build_formulation_tool_spec(
+        self, expected_num_components: int
+    ) -> Optional[Tuple[List[Dict[str, Any]], Any, str]]:
+        """
+        Build OpenAI Chat Completions tool spec for strict function calling outputs.
+
+        Returns:
+            (tools, tool_choice, function_name) or None if unsupported.
+        """
+        schema = self._build_formulation_parameters_schema(expected_num_components)
+        if schema is None:
+            return None
+
+        fn_name = "emit_des_formulation_v1"
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": fn_name,
+                    "description": (
+                        "Emit a DES formulation object that strictly matches the required JSON schema."
+                    ),
+                    "strict": True,
+                    "parameters": schema,
+                },
             }
+        ]
+
+        tool_choice = {"type": "function", "function": {"name": fn_name}}
+        return tools, tool_choice, fn_name
+
+    def _build_formulation_response_format(self, expected_num_components: int) -> Optional[Dict[str, Any]]:
+        """
+        Build OpenAI Chat Completions `response_format` for structured outputs.
+
+        Notes:
+        - We keep the schema intentionally simple (supported subset) so it works
+          across OpenAI-compatible deployments.
+        - Even with strict schema, we still validate locally before persisting.
+        """
+        schema = self._build_formulation_parameters_schema(expected_num_components)
+        if schema is None:
+            return None
 
         return {
             "type": "json_schema",

@@ -14,6 +14,8 @@ import threading
 from typing import Optional, Dict, Any, Iterable
 from openai import OpenAI
 
+from .serialization import to_jsonable
+
 logger = logging.getLogger(__name__)
 
 
@@ -148,8 +150,12 @@ class LLMClient:
         reasoning_effort: Optional[str] = None,
         verbosity: Optional[str] = None,
         response_format: Optional[Dict[str, Any]] = None,
+        tools: Optional[list] = None,
+        tool_choice: Optional[Any] = None,
+        parallel_tool_calls: Optional[bool] = None,
+        return_tool_calls: bool = False,
         **kwargs
-    ) -> str:
+    ) -> Any:
         """
         Send a chat completion request.
 
@@ -160,10 +166,15 @@ class LLMClient:
             max_tokens: Override default max_tokens
             reasoning_effort: OpenAI reasoning effort (e.g., "none", "low", "medium", "high")
             verbosity: OpenAI verbosity (e.g., "low", "medium", "high")
+            tools: OpenAI Chat Completions tools spec (function calling)
+            tool_choice: OpenAI tool_choice (force/auto) for tools
+            parallel_tool_calls: OpenAI parallel_tool_calls flag
+            return_tool_calls: If True, return a dict with tool_calls + content
             **kwargs: Additional parameters for API call
 
         Returns:
-            Generated text response
+            By default: Generated text response (str).
+            If return_tool_calls=True: dict with keys {content, tool_calls, raw_response}.
         """
         # Build messages
         messages = []
@@ -195,6 +206,9 @@ class LLMClient:
             "reasoning_effort",
             "verbosity",
             "response_format",
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
         }
         if any(k in kwargs for k in reserved):
             logger.warning(
@@ -216,6 +230,15 @@ class LLMClient:
             if effective_response_format is not None:
                 if not self._is_chat_param_unsupported("response_format"):
                     params["response_format"] = effective_response_format
+            if tools is not None:
+                if not self._is_chat_param_unsupported("tools"):
+                    params["tools"] = tools
+            if tool_choice is not None:
+                if not self._is_chat_param_unsupported("tool_choice"):
+                    params["tool_choice"] = tool_choice
+            if parallel_tool_calls is not None:
+                if not self._is_chat_param_unsupported("parallel_tool_calls"):
+                    params["parallel_tool_calls"] = bool(parallel_tool_calls)
 
         # Token limit mapping (OpenAI: max_completion_tokens; others: max_tokens)
         effective_max_tokens = self.max_tokens if max_tokens is None else max_tokens
@@ -246,10 +269,20 @@ class LLMClient:
         for attempt in range(3):
             try:
                 response = self.client.chat.completions.create(**request_params)
-                content = response.choices[0].message.content or ""
+                message = response.choices[0].message
+                content = message.content or ""
 
                 logger.debug(f"LLM response: {content[:100]}...")
-                return content
+                if not return_tool_calls:
+                    return content
+
+                # Tool calls may be OpenAI SDK objects; convert to JSON-safe structures.
+                tool_calls = getattr(message, "tool_calls", None)
+                return {
+                    "content": content,
+                    "tool_calls": to_jsonable(tool_calls),
+                    "raw_response": None,  # keep interface stable; don't persist SDK objects
+                }
 
             except TypeError as e:
                 # Compatibility layer for older OpenAI SDK versions that don't
@@ -284,6 +317,25 @@ class LLMClient:
                     logger.warning(
                         "OpenAI API rejected response_format (provider=%s, model=%s). "
                         "Retrying without it. Error: %s",
+                        self.provider,
+                        self.model,
+                        msg[:300],
+                    )
+                    continue
+
+                if (
+                    self.provider == "openai"
+                    and ("tools" in request_params or "tool_choice" in request_params)
+                    and ("tools" in msg or "tool_choice" in msg or "parallel_tool_calls" in msg)
+                ):
+                    # Some proxies/SDK versions reject tools via HTTP 400.
+                    for k in ("tools", "tool_choice", "parallel_tool_calls"):
+                        if k in request_params:
+                            self._mark_chat_param_unsupported(k)
+                            request_params.pop(k, None)
+                    logger.warning(
+                        "OpenAI API rejected tools/tool_choice (provider=%s, model=%s). "
+                        "Retrying without tool calling. Error: %s",
                         self.provider,
                         self.model,
                         msg[:300],
