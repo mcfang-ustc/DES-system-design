@@ -78,9 +78,16 @@ export interface MemoryItemSummary {
 export interface TrajectoryStep {
   action: string;
   reasoning: string;
+  phase?: string;
+  iteration?: number;
   tool?: string;
   num_memories?: number;
   formulation?: FormulationData;
+  result_summary?: string;
+  observation?: string;
+  knowledge_updated?: any[];
+  key_insights?: any[];
+  information_gaps?: any[];
 }
 
 export interface Trajectory {
