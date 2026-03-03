@@ -170,6 +170,26 @@ class DESAgent:
             if len(knowledge_state['memories']) > 3:
                 memory_summary += f"  ... and {len(knowledge_state['memories']) - 3} more\n"
 
+        # ===== P2: Budgets + stagnation signals (used for prompts and policy guards) =====
+        agent_cfg = self.config.get("agent", {}) or {}
+        max_corerag = int(agent_cfg.get("max_corerag_queries", 2))
+        max_largerag = int(agent_cfg.get("max_largerag_queries", 8))
+        max_parallel = int(agent_cfg.get("max_parallel_queries", 1))
+
+        expected_num_components = int(task.get("num_components") or 2)
+        num_valid_candidates = self._count_valid_candidates(
+            knowledge_state.get("formulation_candidates") or [],
+            expected_num_components,
+        )
+        stagnating = self._is_stagnating(knowledge_state.get("observations") or [])
+
+        final_round_note = ""
+        if remaining_iterations <= 2:
+            final_round_note = (
+                "**Time Note**: You are in the final rounds. Prefer generating a complete, testable formulation "
+                "and finishing over additional searching unless there is a single critical missing detail.\n"
+            )
+
         think_prompt = f"""You are a DES (Deep Eutectic Solvent) formulation expert planning your research approach.
 
 **Task**: {task['description']}
@@ -177,15 +197,23 @@ class DESAgent:
 **Target Temperature**: {task.get('target_temperature', 25)}°C
 **Constraints**: {task.get('constraints', {})}
 
-**Progress**: Iteration {iteration}/{max_iterations} ({progress_pct}% complete, {remaining_iterations} remaining) - **{stage} Stage**
+**Stage**: **{stage}**
+{final_round_note}
 
 **Current Knowledge State**:
 - Memories retrieved: {knowledge_state['memories_retrieved']} ({len(knowledge_state['memories'] or [])} items)
 {memory_summary}
 - Theoretical knowledge (CoreRAG): {theory_summary} (failed attempts: {failed_theory})
 - Literature knowledge (LargeRAG): {literature_summary} (failed attempts: {failed_literature})
-- Formulation candidates generated: {len(knowledge_state['formulation_candidates'])}
+- Formulation candidates generated: {len(knowledge_state['formulation_candidates'])} (valid: {num_valid_candidates})
 - Previous observations: {len(knowledge_state['observations'])}
+- query_parallel executed: {int(knowledge_state.get('num_parallel_queries', 0))} (budget: {max_parallel})
+- Stagnation detected: {stagnating}
+
+**Tool Budgets (hard caps)**:
+- CoreRAG queries: max {max_corerag}
+- LargeRAG queries: max {max_largerag}
+- query_parallel actions: max {max_parallel}
 
 **Recent Observations**:
 {self._format_observations(knowledge_state['observations'][-2:] if len(knowledge_state['observations']) > 0 else [])}
@@ -195,17 +223,23 @@ class DESAgent:
 
 **Available Actions**:
 1. **retrieve_memories** - Get past experiences from ReasoningBank (validated experimental data). NOTE: If returned empty in last iteration, you may skip and proceed with other tools.
-2. **query_theory** - Query CoreRAG ontology for theoretical principles
-3. **query_literature** - Query LargeRAG for literature data
-4. **query_parallel** - Query both CoreRAG and LargeRAG simultaneously
-5. **generate_formulation** - Generate DES formulation from accumulated knowledge
-6. **refine_formulation** - Refine existing formulation with more information
-7. **finish** - Complete task (only if formulation is ready)
+2. **query_literature** - Query LargeRAG for literature data (empirical recipes, conditions, performance)
+3. **query_theory** - Query CoreRAG ontology for theoretical principles (mechanistic/design-rule gaps; expensive)
+4. **generate_formulation** - Generate DES formulation from accumulated knowledge
+5. **refine_formulation** - Refine existing formulation with more information
+6. **finish** - Complete task (only if formulation is ready)
+7. **query_parallel** - Query both CoreRAG and LargeRAG simultaneously (RARE: only when you explicitly need BOTH and budgets allow)
 
 **Tool Characteristics**:
 - **ReasoningBank (retrieve_memories)**: Instant retrieval of validated past experiments - **MOST RELIABLE WHEN AVAILABLE**. If empty, no relevant memories exist - this is acceptable, proceed with other tools.
 - **LargeRAG (query_literature)**: Fast vector search (~1-2 seconds) across 10,000+ papers
-- **CoreRAG (query_theory)**: Deep ontology reasoning (~5-10 minutes per query)
+- **CoreRAG (query_theory)**: Deep ontology reasoning (~5-10 minutes per query) - use sparingly and only for specific mechanistic/design-rule gaps
+
+**Research Workflow (coarse-to-fine, stop early when done)**:
+1) **Global map**: Use at most ONE broad query to map the design space (literature OR theory). Use query_parallel only if BOTH are missing and you need a fast global overview.
+2) **Gap-driven deepening**: Each additional query must target ONE concrete information gap. Avoid repeating broad queries.
+3) **Formulate + refine**: Once you have at least two knowledge sources (e.g., memories + literature, or theory + literature), generate a candidate and iterate on it.
+4) **Stop**: If new queries are not adding new key insights / information gaps are repeating, stop searching and produce the best testable formulation.
 
 **Note: Use Memory to Guide Theory and Literature Queries**:
 1. **retrieve memories first** (in iteration 1) if not yet retrieved - memories contain validated experimental data
@@ -226,6 +260,10 @@ class DESAgent:
 - Good query: "What are the key principles for cellulose dissolution via DES? Include hydrogen bonding mechanisms, component selection criteria, and molar ratio considerations."
 - Poor query: Multiple narrow queries like "What is hydrogen bonding?" then "What about molar ratios?" (wasteful)
 
+**Parallel Query Policy (IMPORTANT)**:
+- **query_parallel is NOT the default.** Use it only when you explicitly need BOTH (mechanistic theory + empirical recipes) AND at least one of them is still missing.
+- If you already have both theory and literature, prefer generate_formulation/refine_formulation instead of query_parallel.
+
 **Decision Guidelines by Stage**:
 - **Early ({stage == 'Early' and '✓' or '✗'})**:
   - **Priority 1**: Retrieve memories if not yet done. If returns 0, immediately proceed to Priority 2.
@@ -240,10 +278,10 @@ class DESAgent:
 - **DO NOT repeat the same action if result is unchanged**:
   * If retrieve_memories returns 0 results → This means NO historical data exists. DO NOT retry. Immediately move to theory/literature queries.
   * If a query returns empty/unchanged results twice → move to alternative action
-- **Progress awareness**: At {progress_pct}% complete, prioritize actions that move towards formulation generation
+- **Stage awareness**: Prioritize actions that move towards formulation generation and completion (especially in Late stage)
 
 **Your Task**:
-Given your current progress ({iteration}/{max_iterations}, {stage} stage), analyze the knowledge state and decide the SINGLE most valuable next action.
+Analyze the knowledge state and decide the SINGLE most valuable next action. You do NOT need to use all iterations; stop early if information is sufficient or new queries are not adding value.
 
 Output JSON:
 {{
@@ -267,29 +305,58 @@ Output JSON:
                 logger.warning(f"Invalid action '{thought.get('action')}', defaulting to retrieve_memories")
                 thought["action"] = "retrieve_memories"
 
-            return thought
+            # Apply deterministic policy guards (budgets, anti-parallel default, stagnation).
+            return self._apply_think_policy(thought, task, knowledge_state, iteration, max_iterations)
 
         except Exception as e:
             logger.error(f"Think phase failed: {e}")
             # Fallback: simple heuristic
             if not knowledge_state["memories_retrieved"]:
-                return {
+                return self._apply_think_policy(
+                    {
                     "action": "retrieve_memories",
                     "reasoning": "Starting with memory retrieval (fallback decision)",
                     "information_gaps": ["All information"]
-                }
+                    },
+                    task,
+                    knowledge_state,
+                    iteration,
+                    max_iterations,
+                )
             elif not knowledge_state["theory_knowledge"] and not knowledge_state["literature_knowledge"]:
-                return {
-                    "action": "query_parallel",
-                    "reasoning": "Need both theory and literature (fallback decision)",
-                    "information_gaps": ["Theory", "Literature"]
-                }
+                # Prefer literature first (fast, empirical). Only use CoreRAG if necessary/available.
+                if self.largerag:
+                    base = {
+                        "action": "query_literature",
+                        "reasoning": "Need empirical recipes/conditions to ground the search (fallback decision)",
+                        "information_gaps": ["Empirical recipes", "Room-temperature performance data"],
+                    }
+                elif self.corerag:
+                    base = {
+                        "action": "query_theory",
+                        "reasoning": "Need mechanistic/design-rule guidance (fallback decision)",
+                        "information_gaps": ["Mechanism", "Design rules"],
+                    }
+                else:
+                    base = {
+                        "action": "generate_formulation",
+                        "reasoning": "Tools unavailable; generate best-effort formulation from parametric knowledge (fallback decision)",
+                        "information_gaps": [],
+                    }
+
+                return self._apply_think_policy(base, task, knowledge_state, iteration, max_iterations)
             else:
-                return {
+                return self._apply_think_policy(
+                    {
                     "action": "generate_formulation",
                     "reasoning": "Have sufficient information (fallback decision)",
                     "information_gaps": []
-                }
+                    },
+                    task,
+                    knowledge_state,
+                    iteration,
+                    max_iterations,
+                )
 
     def _act(self, action: str, task: Dict, knowledge_state: Dict, tool_calls: List) -> Dict:
         """
@@ -363,6 +430,7 @@ Output JSON:
 
         elif action == "query_parallel":
             # Parallel query both tools
+            knowledge_state["num_parallel_queries"] = knowledge_state.get("num_parallel_queries", 0) + 1
             theory, literature = self._query_tools_parallel(task, knowledge_state)
 
             if theory:
@@ -612,6 +680,209 @@ Output JSON:
 
         return formatted
 
+    # ===== P2: Action policy helpers (query budgets + anti-parallel default) =====
+
+    @staticmethod
+    def _normalize_text_list(items: Any) -> List[str]:
+        """
+        Normalize a list of free-form strings for simple similarity checks.
+
+        This is intentionally lightweight: it lets us detect obvious stagnation
+        (e.g., identical information_gaps across consecutive iterations).
+        """
+        if not isinstance(items, list):
+            return []
+        out: List[str] = []
+        for x in items:
+            if x is None:
+                continue
+            s = str(x).strip().lower()
+            if not s:
+                continue
+            s = re.sub(r"\s+", " ", s)
+            out.append(s)
+        return out
+
+    def _is_stagnating(self, observations: List[Dict]) -> bool:
+        """
+        Return True when the agent is likely looping without new information.
+
+        Heuristic (cheap + robust):
+        - If the last two iterations report the same normalized information_gaps,
+          assume additional broad queries are not adding value.
+        """
+        if not observations or len(observations) < 2:
+            return False
+
+        last = observations[-1] if isinstance(observations[-1], dict) else {}
+        prev = observations[-2] if isinstance(observations[-2], dict) else {}
+
+        gaps_last = set(self._normalize_text_list(last.get("information_gaps")))
+        gaps_prev = set(self._normalize_text_list(prev.get("information_gaps")))
+
+        if gaps_last and gaps_last == gaps_prev:
+            return True
+
+        return False
+
+    def _count_valid_candidates(self, candidates: List[Any], expected_num_components: int) -> int:
+        """Count schema-valid formulation candidates currently in the knowledge_state."""
+        n = 0
+        for cand in candidates or []:
+            if not isinstance(cand, dict):
+                continue
+            f_norm = normalize_formulation(cand.get("formulation"), expected_num_components)
+            ok_f, _ = validate_formulation(
+                f_norm, expected_num_components, require_functions=True
+            )
+            if ok_f:
+                n += 1
+        return n
+
+    def _apply_think_policy(
+        self,
+        thought: Dict[str, Any],
+        task: Dict,
+        knowledge_state: Dict,
+        iteration: int,
+        max_iterations: int,
+    ) -> Dict[str, Any]:
+        """
+        Deterministic policy layer on top of LLM planning.
+
+        Goals:
+        - Prevent default overuse of query_parallel (especially CoreRAG load).
+        - Enforce basic budgets (configurable) for CoreRAG/LargeRAG/parallel.
+        - Encourage earlier formulation once sufficient knowledge exists.
+        - Stop early when we already have a valid, testable formulation.
+        """
+        if not isinstance(thought, dict):
+            return {"action": "generate_formulation", "reasoning": "Invalid thought object", "information_gaps": []}
+
+        thought.setdefault("action", "generate_formulation")
+        thought.setdefault("reasoning", "")
+        if not isinstance(thought.get("information_gaps"), list):
+            thought["information_gaps"] = []
+
+        agent_cfg = self.config.get("agent", {}) or {}
+        max_corerag = int(agent_cfg.get("max_corerag_queries", 2))
+        max_largerag = int(agent_cfg.get("max_largerag_queries", 8))
+        max_parallel = int(agent_cfg.get("max_parallel_queries", 1))
+
+        expected_num_components = int(task.get("num_components") or 2)
+        num_valid = self._count_valid_candidates(
+            knowledge_state.get("formulation_candidates") or [],
+            expected_num_components,
+        )
+
+        remaining = max_iterations - iteration
+        stagnating = self._is_stagnating(knowledge_state.get("observations") or [])
+
+        num_theory = int(knowledge_state.get("num_theory_queries", 0))
+        num_lit = int(knowledge_state.get("num_literature_queries", 0))
+        num_parallel = int(knowledge_state.get("num_parallel_queries", 0))
+        num_candidates = len(knowledge_state.get("formulation_candidates") or [])
+
+        last_obs = None
+        if knowledge_state.get("observations"):
+            maybe = (knowledge_state.get("observations") or [])[-1]
+            last_obs = maybe if isinstance(maybe, dict) else None
+
+        info_sufficient = bool(last_obs.get("information_sufficient")) if isinstance(last_obs, dict) else False
+
+        # 1) If we already have a valid candidate and info is sufficient -> finish now.
+        if num_valid > 0 and info_sufficient:
+            thought["action"] = "finish"
+            thought["reasoning"] = (
+                "Policy: information is sufficient and a schema-valid formulation exists; finishing early.\n"
+                + str(thought.get("reasoning") or "").strip()
+            ).strip()
+            return thought
+
+        original_action = str(thought.get("action") or "").strip()
+        action = original_action
+        override_reason: Optional[str] = None
+
+        # 2) Enforce query budgets (CoreRAG/LargeRAG/parallel).
+        if action == "query_theory" and num_theory >= max_corerag:
+            action = "query_literature" if self.largerag and num_lit < max_largerag else "generate_formulation"
+            override_reason = f"CoreRAG budget reached (>= {max_corerag}); avoiding additional theory queries."
+
+        if action == "query_literature" and num_lit >= max_largerag:
+            action = "generate_formulation"
+            override_reason = f"LargeRAG budget reached (>= {max_largerag}); moving to formulation."
+
+        if action == "query_parallel":
+            # query_parallel is never the default; allow only when BOTH are missing and budget allows.
+            has_theory = num_theory > 0
+            has_lit = num_lit > 0
+
+            if num_parallel >= max_parallel:
+                action = "query_literature" if self.largerag and num_lit < max_largerag else "generate_formulation"
+                override_reason = f"query_parallel budget reached (>= {max_parallel}); avoid running both tools again."
+            elif has_theory and not has_lit:
+                action = "query_literature" if self.largerag else "generate_formulation"
+                override_reason = "Already have theory; query literature only (avoid unnecessary CoreRAG)."
+            elif has_lit and not has_theory:
+                action = "query_theory" if self.corerag and num_theory < max_corerag else "generate_formulation"
+                override_reason = "Already have literature; query theory only if budget allows."
+            elif has_theory and has_lit:
+                # When both exist, parallel adds cost but rarely adds decisive value.
+                action = "generate_formulation" if num_candidates == 0 else "refine_formulation"
+                override_reason = "Already have theory + literature; move to formulation instead of parallel querying."
+            else:
+                # Both missing: allow at most once (budgeted) early in the run.
+                pass
+
+        # 3) Stagnation: if gaps repeat, stop searching and write/refine.
+        if stagnating and action in ("query_theory", "query_literature", "query_parallel"):
+            if num_candidates == 0:
+                action = "generate_formulation"
+                override_reason = "Stagnation detected (repeating information gaps); stop querying and generate a candidate."
+            elif num_valid > 0:
+                action = "finish"
+                override_reason = "Stagnation detected and a valid candidate exists; finishing early."
+            else:
+                action = "refine_formulation"
+                override_reason = "Stagnation detected; refine candidates instead of more searching."
+
+        # 4) Encourage earlier formulation once sufficient sources exist.
+        # If we already have both theory+literature and still no candidates, don't keep querying.
+        if (
+            action in ("query_theory", "query_literature", "query_parallel")
+            and num_candidates == 0
+            and num_theory > 0
+            and num_lit > 0
+            and iteration >= max(4, int(0.3 * max_iterations))
+        ):
+            action = "generate_formulation"
+            override_reason = "Already have theory + literature; generate formulation instead of additional queries."
+
+        # 5) Final rounds: prioritize producing/finishing.
+        if remaining <= 2 and action in ("query_theory", "query_parallel"):
+            # CoreRAG is slow; late-stage parallel/theory is rarely worth it.
+            action = "generate_formulation" if num_candidates == 0 else "refine_formulation"
+            override_reason = "Final rounds policy: avoid slow theory/parallel queries; focus on formulation output."
+
+        # Ensure tools exist for the chosen query action.
+        if action == "query_theory" and not self.corerag:
+            action = "query_literature" if self.largerag else "generate_formulation"
+            override_reason = "CoreRAG unavailable; switching action."
+        if action == "query_literature" and not self.largerag:
+            action = "query_theory" if self.corerag and num_theory < max_corerag else "generate_formulation"
+            override_reason = "LargeRAG unavailable; switching action."
+        if action == "query_parallel" and not (self.corerag or self.largerag):
+            action = "generate_formulation"
+            override_reason = "No tools available for query_parallel; switching to formulation."
+
+        # Apply override
+        if action != original_action:
+            thought["action"] = action
+            prefix = f"Policy override: {override_reason}" if override_reason else "Policy override applied."
+            thought["reasoning"] = (prefix + "\n" + str(thought.get("reasoning") or "").strip()).strip()
+
+        return thought
+
     def _parse_json_response(self, llm_output: str) -> Dict:
         """Parse JSON from LLM response with multiple fallback strategies."""
         # Try to extract JSON block
@@ -650,8 +921,16 @@ Output JSON:
         except Exception as e:
             logger.error(f"Parallel query failed: {e}")
             # Fallback to sequential
-            theory = self._query_corerag(task, knowledge_state)
-            literature = self._query_largerag(task, knowledge_state)
+            agent_cfg = self.config.get("agent", {}) or {}
+            max_corerag = int(agent_cfg.get("max_corerag_queries", 2))
+            max_largerag = int(agent_cfg.get("max_largerag_queries", 8))
+
+            theory = None
+            literature = None
+            if self.corerag and int(knowledge_state.get("num_theory_queries", 0)) < max_corerag:
+                theory = self._query_corerag(task, knowledge_state)
+            if self.largerag and int(knowledge_state.get("num_literature_queries", 0)) < max_largerag:
+                literature = self._query_largerag(task, knowledge_state)
             return theory, literature
 
     async def _query_tools_parallel_async(self, task: Dict, knowledge_state: Dict) -> Tuple[Optional[Dict], Optional[Dict]]:
@@ -662,14 +941,22 @@ Output JSON:
         async def return_none():
             return None
 
+        # Policy guard: CoreRAG is expensive. If budgets are exceeded, skip the tool
+        # even when query_parallel is selected (prevents runaway CoreRAG calls).
+        agent_cfg = self.config.get("agent", {}) or {}
+        max_corerag = int(agent_cfg.get("max_corerag_queries", 2))
+        max_largerag = int(agent_cfg.get("max_largerag_queries", 8))
+        allow_corerag = bool(self.corerag) and int(knowledge_state.get("num_theory_queries", 0)) < max_corerag
+        allow_largerag = bool(self.largerag) and int(knowledge_state.get("num_literature_queries", 0)) < max_largerag
+
         # Create tasks
         tasks = []
-        if self.corerag:
+        if allow_corerag:
             tasks.append(loop.run_in_executor(None, self._query_corerag, task, knowledge_state))
         else:
             tasks.append(return_none())
 
-        if self.largerag:
+        if allow_largerag:
             tasks.append(loop.run_in_executor(None, self._query_largerag, task, knowledge_state))
         else:
             tasks.append(return_none())
@@ -725,6 +1012,7 @@ Output JSON:
             "information_gaps": [],  # Track what we still need to know
             "num_theory_queries": 0,  # Track number of CoreRAG queries
             "num_literature_queries": 0,  # Track number of LargeRAG queries
+            "num_parallel_queries": 0,  # Track number of query_parallel actions executed
             "failed_theory_attempts": 0,  # NEW: Track failed CoreRAG attempts
             "failed_literature_attempts": 0,  # NEW: Track failed LargeRAG attempts
         }
@@ -794,6 +1082,36 @@ Output JSON:
                 "key_insights": observation.get("key_insights", []),
                 "information_gaps": observation.get("information_gaps", [])
             })
+
+            # ===== P2: Early stopping (avoid "always run to max_iterations") =====
+            #
+            # If we already have at least one schema-valid formulation candidate and the
+            # OBSERVE analysis says information is sufficient (or we are stagnating),
+            # stop looping and finalize. This preserves research quality while avoiding
+            # redundant tool calls (especially CoreRAG).
+            if bool(self.config.get("agent", {}).get("allow_early_stopping", True)):
+                expected_num_components = int(task.get("num_components") or 2)
+                num_valid = self._count_valid_candidates(
+                    knowledge_state.get("formulation_candidates") or [],
+                    expected_num_components,
+                )
+                stagnating = self._is_stagnating(knowledge_state.get("observations") or [])
+                remaining = max_iterations - iteration
+
+                if num_valid > 0 and (
+                    bool(observation.get("information_sufficient"))
+                    or stagnating
+                    or remaining <= 1
+                ):
+                    logger.info(
+                        "[Policy] Early stopping: valid formulation exists and information is sufficient/stalled (valid=%s, suff=%s, stagnating=%s, remaining=%s).",
+                        num_valid,
+                        bool(observation.get("information_sufficient")),
+                        stagnating,
+                        remaining,
+                    )
+                    task_complete = True
+                    break
 
         # ===== Finalize Formulation =====
         logger.info(f"\n[ReAct Agent] Finalizing after {iteration} iterations")
@@ -1282,6 +1600,9 @@ Output ONLY the query text (no JSON, no explanation):"""
             "requested_response_format": bool(response_format),
             "used_response_format": False,
             "strategy_used": None,
+            # Two-stage structured output: draft (reasoning) -> strict JSON (no reasoning)
+            "draft_used": False,
+            "draft_output": "",
             "repair_used": False,
             "parse_ok": False,
             "validation_ok": False,
@@ -1326,7 +1647,14 @@ Output ONLY the query text (no JSON, no explanation):"""
                             return parsed
             return None
 
-        def _attempt(llm_prompt: str, *, strategy: str) -> Dict:
+        def _attempt(
+            llm_prompt: str,
+            *,
+            strategy: str,
+            reasoning_effort: Optional[str] = None,
+            temperature: Optional[float] = None,
+            max_tokens: Optional[int] = None,
+        ) -> Dict:
             """One LLM attempt + parse/normalize/validate."""
             try:
                 diagnostics["strategy_used"] = strategy
@@ -1340,6 +1668,9 @@ Output ONLY the query text (no JSON, no explanation):"""
                         tool_choice=tool_choice,
                         parallel_tool_calls=False,
                         return_tool_calls=True,
+                        reasoning_effort=reasoning_effort,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
                     )
                     llm_output = str((resp or {}).get("content") or "")
                     tool_calls = (resp or {}).get("tool_calls")
@@ -1356,13 +1687,24 @@ Output ONLY the query text (no JSON, no explanation):"""
                         }
                     diagnostics["used_tool_call"] = True
                 elif strategy == "response_format" and response_format is not None:
-                    llm_output = self.llm_client(llm_prompt, response_format=response_format)
+                    llm_output = self.llm_client(
+                        llm_prompt,
+                        response_format=response_format,
+                        reasoning_effort=reasoning_effort,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
                     llm_output = llm_output or ""
                     diagnostics["raw_outputs"].append(llm_output)
                     diagnostics["used_response_format"] = True
                     parsed = loads_json_from_text(llm_output)
                 else:
-                    llm_output = self.llm_client(llm_prompt)
+                    llm_output = self.llm_client(
+                        llm_prompt,
+                        reasoning_effort=reasoning_effort,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
                     llm_output = llm_output or ""
                     diagnostics["raw_outputs"].append(llm_output)
                     parsed = loads_json_from_text(llm_output)
@@ -1446,8 +1788,137 @@ Output ONLY the query text (no JSON, no explanation):"""
 
         primary_strategy = "tool_call" if tool_spec is not None else ("response_format" if response_format is not None else "text")
 
-        # Attempt 1
-        attempt1 = _attempt(prompt, strategy=primary_strategy)
+        # ===== P0: Two-stage formulation generation =====
+        #
+        # Stage 1 (draft): keep high-quality research reasoning (often reasoning_effort=xhigh).
+        # Stage 2 (structured): disable reasoning (reasoning_effort=none) to get reliable
+        # tool calls / json_schema outputs, and validate locally.
+        draft_output = ""
+        try:
+            # Important: The prompt above includes JSON instructions for backward compatibility.
+            # We override them here to get a compact, transcribable draft.
+            if expected_num_components == 2:
+                draft_prompt = (
+                    f"{prompt}\n\n"
+                    "## Stage 1 (Research Draft)\n"
+                    "Propose ONE best candidate formulation.\n"
+                    "IMPORTANT:\n"
+                    "- Do NOT output JSON.\n"
+                    "- Keep it compact, but research-grade.\n"
+                    "- Include exactly the fields listed below.\n\n"
+                    "Required fields:\n"
+                    "- HBD: component name\n"
+                    "- HBA: component name\n"
+                    "- molar_ratio: use ':' separators and match HBD:HBA order\n"
+                    "- reasoning: 3-6 sentences\n"
+                    "- supporting_evidence: 3-8 one-line bullets\n\n"
+                    "Output format (STRICT):\n"
+                    "CANDIDATE:\n"
+                    "HBD: ...\n"
+                    "HBA: ...\n"
+                    "molar_ratio: ...\n"
+                    "reasoning: ...\n"
+                    "supporting_evidence:\n"
+                    "- ...\n"
+                    "- ...\n"
+                )
+            else:
+                draft_prompt = (
+                    f"{prompt}\n\n"
+                    "## Stage 1 (Research Draft)\n"
+                    "Propose ONE best candidate formulation.\n"
+                    "IMPORTANT:\n"
+                    "- Do NOT output JSON.\n"
+                    "- Keep it compact, but research-grade.\n"
+                    "- Include exactly the fields listed below.\n\n"
+                    "Required fields:\n"
+                    f"- components: exactly {expected_num_components} items; each item has name / role / function\n"
+                    "- molar_ratio: use ':' separators and match the component order\n"
+                    "- reasoning: 4-8 sentences\n"
+                    "- supporting_evidence: 3-8 one-line bullets\n"
+                    "- synergy_explanation: 3-6 sentences\n\n"
+                    "Output format (STRICT):\n"
+                    "CANDIDATE:\n"
+                    "components:\n"
+                    "  1) name=... | role=... | function=...\n"
+                    "  2) ...\n"
+                    "molar_ratio: ...\n"
+                    "reasoning: ...\n"
+                    "synergy_explanation: ...\n"
+                    "supporting_evidence:\n"
+                    "- ...\n"
+                    "- ...\n"
+                )
+
+            draft_output = self.llm_client(
+                draft_prompt,
+                max_tokens=int(self.config.get("agent", {}).get("draft_max_tokens", 1400)),
+            )
+            draft_output = draft_output or ""
+            diagnostics["draft_used"] = bool(draft_output.strip())
+            diagnostics["draft_output"] = draft_output
+        except Exception as e:
+            logger.warning(
+                "[Formulation] Draft stage failed; proceeding with one-shot structured output. Error: %s",
+                str(e),
+            )
+            diagnostics["draft_used"] = False
+            diagnostics["draft_output"] = ""
+            draft_output = ""
+
+        # Stage 2: strict structured output (transcription)
+        # Use no-reasoning + temperature=0 for maximum schema reliability.
+        structured_reasoning_effort = str(
+            self.config.get("agent", {}).get("structured_reasoning_effort", "none")
+        )
+        structured_temperature = float(
+            self.config.get("agent", {}).get("structured_temperature", 0.0)
+        )
+        structured_max_tokens = int(
+            self.config.get("agent", {}).get("structured_max_tokens", 1800)
+        )
+
+        source_text = draft_output.strip() if draft_output.strip() else prompt
+        if expected_num_components == 2:
+            transcribe_prompt = (
+                "You are a strict JSON transcriber.\n"
+                "Convert the following formulation draft into a JSON object that EXACTLY matches the required schema.\n"
+                "Rules:\n"
+                "- You MUST output formulation.HBD (string), formulation.HBA (string), formulation.molar_ratio (string).\n"
+                "- molar_ratio MUST have exactly 1 ':' separator (HBD:HBA).\n"
+                "- reasoning MUST be a non-empty string.\n"
+                "- supporting_evidence MUST be a JSON array of strings.\n"
+                "- Do NOT introduce components not present in the draft.\n"
+                "- Output ONLY the final structured object; no extra text.\n\n"
+                "Draft:\n"
+                f"{source_text}\n"
+            )
+        else:
+            transcribe_prompt = (
+                "You are a strict JSON transcriber.\n"
+                "Convert the following formulation draft into a JSON object that EXACTLY matches the required schema.\n"
+                "Rules:\n"
+                f"- You MUST output exactly {expected_num_components} components.\n"
+                "- components MUST be a JSON array.\n"
+                "- Each component MUST have non-empty string fields: name, role, function.\n"
+                f"- molar_ratio MUST have {expected_num_components - 1} ':' separators.\n"
+                "- synergy_explanation MUST be a non-empty string.\n"
+                "- supporting_evidence MUST be a JSON array of strings.\n"
+                "- Do NOT invent new components not present in the draft.\n"
+                "- If a required field is missing for an existing component, fill it in conservatively.\n"
+                "- Output ONLY the final structured object; no extra text.\n\n"
+                "Draft:\n"
+                f"{source_text}\n"
+            )
+
+        # Attempt 1 (structured transcribe)
+        attempt1 = _attempt(
+            transcribe_prompt,
+            strategy=primary_strategy,
+            reasoning_effort=structured_reasoning_effort,
+            temperature=structured_temperature,
+            max_tokens=structured_max_tokens,
+        )
         cand = attempt1["candidate"]
         fatal_errors = attempt1.get("fatal_errors") or []
         notes = attempt1.get("notes") or []
@@ -1458,7 +1929,13 @@ Output ONLY the query text (no JSON, no explanation):"""
             # by SDK/proxy), fall back to response_format (if available) using the full prompt.
             if primary_strategy == "tool_call" and not diagnostics.get("used_tool_call"):
                 secondary = "response_format" if response_format is not None else "text"
-                attempt2 = _attempt(prompt, strategy=secondary)
+                attempt2 = _attempt(
+                    transcribe_prompt,
+                    strategy=secondary,
+                    reasoning_effort=structured_reasoning_effort,
+                    temperature=structured_temperature,
+                    max_tokens=structured_max_tokens,
+                )
             else:
                 diagnostics["repair_used"] = True
                 repair_prompt = self._build_formulation_repair_prompt(
@@ -1467,7 +1944,13 @@ Output ONLY the query text (no JSON, no explanation):"""
                     previous_output=(diagnostics["raw_outputs"][-1] if diagnostics["raw_outputs"] else ""),
                     errors=(fatal_errors or ["unparseable JSON output"]),
                 )
-                attempt2 = _attempt(repair_prompt, strategy=primary_strategy)
+                attempt2 = _attempt(
+                    repair_prompt,
+                    strategy=primary_strategy,
+                    reasoning_effort=structured_reasoning_effort,
+                    temperature=structured_temperature,
+                    max_tokens=structured_max_tokens,
+                )
             cand2 = attempt2["candidate"]
             fatal_errors2 = attempt2.get("fatal_errors") or []
             notes2 = attempt2.get("notes") or []

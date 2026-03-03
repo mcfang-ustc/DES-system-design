@@ -65,6 +65,7 @@ Analyze the action result and provide structured insights to guide the agent's n
    - Options: retrieve_memories, query_theory, query_literature, query_parallel, generate_formulation, refine_formulation, finish
    - Base recommendation on: information gaps + progress stage + tool availability
    - **CRITICAL**: If a tool has failed 2+ times, DO NOT recommend it again
+   - **Parallel policy**: Do NOT recommend query_parallel as a default. Recommend it only when you explicitly need BOTH theory + literature AND at least one is still missing. If both are already available, prefer generate_formulation/refine_formulation.
 
 **Special Considerations**:
 

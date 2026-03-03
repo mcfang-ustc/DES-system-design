@@ -96,6 +96,13 @@ agent:
   enable_memory_injection: true  # Inject retrieved memories into prompt
   explain_memory_usage: true  # Agent should explain why it uses each memory
 
+  # Planning / Query Policy (P2)
+  # Hard caps to prevent runaway tool usage (especially CoreRAG).
+  # Note: query_parallel consumes BOTH budgets when both tools run.
+  max_corerag_queries: 2
+  max_largerag_queries: 8
+  max_parallel_queries: 1
+
   # Stopping Conditions
   auto_finish_threshold: 0.9  # Auto-finish if formulation confidence >= this value
   allow_early_stopping: true  # Allow LLM to decide "finish" before max_iterations
@@ -103,6 +110,13 @@ agent:
   # Formulation Design
   default_num_components: 2  # Default DES type: 2=binary, 3=ternary, 4=quaternary, etc.
   allow_multi_component: true  # Allow agent to suggest multi-component DES
+
+  # Structured Output Reliability (P0)
+  # Two-stage generation: (1) reasoning draft, (2) strict schema output with reasoning_effort=none.
+  draft_max_tokens: 1400
+  structured_reasoning_effort: "none"
+  structured_temperature: 0.0
+  structured_max_tokens: 1800
 
   # Deprecated (use max_iterations instead)
   # max_steps: 10
