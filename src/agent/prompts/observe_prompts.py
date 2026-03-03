@@ -67,6 +67,10 @@ Analyze the action result and provide structured insights to guide the agent's n
    - **CRITICAL**: If a tool has failed 2+ times, DO NOT recommend it again
    - **Parallel policy**: Do NOT recommend query_parallel as a default. Recommend it only when you explicitly need BOTH theory + literature AND at least one is still missing. If both are already available, prefer generate_formulation/refine_formulation.
 
+7. **Stagnation Detected**: Are we looping without gaining new information?
+   - Set to true when: key insights and information gaps are repeating, and the latest action did not add new quantitative/decisive evidence.
+   - If stagnation is true: recommend generating/refining a formulation or finishing (do not keep querying).
+
 **Special Considerations**:
 
 - **Empty results are acceptable**: If retrieve_memories returns 0, this just means no historical data exists (not a failure)
@@ -94,6 +98,7 @@ Respond with ONLY a valid JSON object (no markdown, no explanation):
         "<specific gap 2>"
     ],
     "information_sufficient": true/false,
+    "stagnation_detected": true/false,
     "recommended_next_action": "<action_name>",
     "recommendation_reasoning": "<1 sentence explaining why this action is recommended>"
 }}
@@ -113,6 +118,7 @@ Respond with ONLY a valid JSON object (no markdown, no explanation):
         "Missing comparative performance data between glycerol and urea at target temperature"
     ],
     "information_sufficient": false,
+    "stagnation_detected": false,
     "recommended_next_action": "query_theory",
     "recommendation_reasoning": "Have literature precedents but need theoretical understanding of why glycerol outperforms urea at low temperature to make informed selection"
 }}

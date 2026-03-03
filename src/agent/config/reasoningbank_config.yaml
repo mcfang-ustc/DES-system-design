@@ -99,9 +99,9 @@ agent:
   # Planning / Query Policy (P2)
   # Hard caps to prevent runaway tool usage (especially CoreRAG).
   # Note: query_parallel consumes BOTH budgets when both tools run.
-  max_corerag_queries: 2
+  max_corerag_queries: 3
   max_largerag_queries: 8
-  max_parallel_queries: 1
+  max_parallel_queries: 3
 
   # Stopping Conditions
   auto_finish_threshold: 0.9  # Auto-finish if formulation confidence >= this value

@@ -172,9 +172,9 @@ class DESAgent:
 
         # ===== P2: Budgets + stagnation signals (used for prompts and policy guards) =====
         agent_cfg = self.config.get("agent", {}) or {}
-        max_corerag = int(agent_cfg.get("max_corerag_queries", 2))
+        max_corerag = int(agent_cfg.get("max_corerag_queries", 3))
         max_largerag = int(agent_cfg.get("max_largerag_queries", 8))
-        max_parallel = int(agent_cfg.get("max_parallel_queries", 1))
+        max_parallel = int(agent_cfg.get("max_parallel_queries", 3))
 
         expected_num_components = int(task.get("num_components") or 2)
         num_valid_candidates = self._count_valid_candidates(
@@ -609,6 +609,12 @@ Output JSON:
             observation["action"] = action_result["action"]
             observation["success"] = action_result["success"]
 
+            # Normalize optional boolean fields (LLM may omit or mis-type them).
+            if not isinstance(observation.get("information_sufficient"), bool):
+                observation["information_sufficient"] = False
+            if not isinstance(observation.get("stagnation_detected"), bool):
+                observation["stagnation_detected"] = False
+
             logger.info(f"[OBSERVE] LLM analysis: {observation.get('summary', 'No summary')[:100]}...")
 
         except Exception as e:
@@ -622,6 +628,7 @@ Output JSON:
                 "key_insights": [],
                 "information_gaps": ["LLM observation failed"],
                 "information_sufficient": False,
+                "stagnation_detected": False,
                 "recommended_next_action": "generate_formulation",
                 "recommendation_reasoning": "Fallback due to LLM error"
             }
@@ -711,10 +718,17 @@ Output JSON:
         - If the last two iterations report the same normalized information_gaps,
           assume additional broad queries are not adding value.
         """
-        if not observations or len(observations) < 2:
+        if not observations:
             return False
 
+        # Prefer the LLM's explicit stagnation judgment when available.
         last = observations[-1] if isinstance(observations[-1], dict) else {}
+        if isinstance(last, dict) and isinstance(last.get("stagnation_detected"), bool):
+            return bool(last.get("stagnation_detected"))
+
+        if len(observations) < 2:
+            return False
+
         prev = observations[-2] if isinstance(observations[-2], dict) else {}
 
         gaps_last = set(self._normalize_text_list(last.get("information_gaps")))
@@ -765,9 +779,9 @@ Output JSON:
             thought["information_gaps"] = []
 
         agent_cfg = self.config.get("agent", {}) or {}
-        max_corerag = int(agent_cfg.get("max_corerag_queries", 2))
+        max_corerag = int(agent_cfg.get("max_corerag_queries", 3))
         max_largerag = int(agent_cfg.get("max_largerag_queries", 8))
-        max_parallel = int(agent_cfg.get("max_parallel_queries", 1))
+        max_parallel = int(agent_cfg.get("max_parallel_queries", 3))
 
         expected_num_components = int(task.get("num_components") or 2)
         num_valid = self._count_valid_candidates(
@@ -922,7 +936,7 @@ Output JSON:
             logger.error(f"Parallel query failed: {e}")
             # Fallback to sequential
             agent_cfg = self.config.get("agent", {}) or {}
-            max_corerag = int(agent_cfg.get("max_corerag_queries", 2))
+            max_corerag = int(agent_cfg.get("max_corerag_queries", 3))
             max_largerag = int(agent_cfg.get("max_largerag_queries", 8))
 
             theory = None
@@ -944,7 +958,7 @@ Output JSON:
         # Policy guard: CoreRAG is expensive. If budgets are exceeded, skip the tool
         # even when query_parallel is selected (prevents runaway CoreRAG calls).
         agent_cfg = self.config.get("agent", {}) or {}
-        max_corerag = int(agent_cfg.get("max_corerag_queries", 2))
+        max_corerag = int(agent_cfg.get("max_corerag_queries", 3))
         max_largerag = int(agent_cfg.get("max_largerag_queries", 8))
         allow_corerag = bool(self.corerag) and int(knowledge_state.get("num_theory_queries", 0)) < max_corerag
         allow_largerag = bool(self.largerag) and int(knowledge_state.get("num_literature_queries", 0)) < max_largerag
