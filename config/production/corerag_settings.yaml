@@ -27,7 +27,6 @@ LLM:
   max_tokens: 5000
   # OpenAI GPT-5.* reasoning controls
   reasoning_effort: "none"
-  verbosity: "medium"
   openai_api_base: "https://api.openai.com/v1"
 
 extractor_examples:
