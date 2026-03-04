@@ -199,6 +199,19 @@ def format_action_result_for_observe(action: str, action_result: dict, knowledge
         result_text += f"**Confidence**: {formulation.get('confidence', 0.0)}\n"
         result_text += f"**Reasoning**: {formulation.get('reasoning', 'N/A')[:200]}...\n"
 
+        acc = formulation.get("_acceptance") if isinstance(formulation, dict) else None
+        if isinstance(acc, dict):
+            result_text += (
+                f"**Acceptance**: accepted={acc.get('accepted')} "
+                f"class={acc.get('recommendation_class')} "
+                f"reasons={acc.get('reasons')}\n"
+            )
+            result_text += f"**Baseline Reference**: {formulation.get('baseline_reference', 'none')}\n"
+            delta = formulation.get("delta_to_baseline")
+            if isinstance(delta, list):
+                preview = delta[:2]
+                result_text += f"**Delta Preview (first 2)**: {preview}\n"
+
     return result_text
 
 

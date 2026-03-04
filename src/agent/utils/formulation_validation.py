@@ -11,6 +11,7 @@ so invalid/empty formulations never get persisted as PENDING recommendations.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Tuple
 
 
@@ -27,6 +28,74 @@ def _is_nonempty_nonunknown(x: Any) -> bool:
     if not s:
         return False
     return s.lower() != "unknown"
+
+
+_PLACEHOLDER_TOKENS = {
+    "?",
+    "n/a",
+    "na",
+    "none",
+    "null",
+    "tbd",
+    "todo",
+    "...",
+    "-",
+    "--",
+}
+
+
+def _is_placeholder_token(s: str) -> bool:
+    s_norm = (s or "").strip().lower()
+    return s_norm in _PLACEHOLDER_TOKENS or s_norm == "unknown"
+
+
+def _is_valid_component_name(x: Any) -> bool:
+    """
+    Component names should be concrete chemicals, not placeholders.
+
+    We intentionally keep this conservative and language-agnostic; it aims to
+    catch the most common low-quality outputs that surface as "unknown" in UI.
+    """
+    s = _as_clean_str(x)
+    if not s:
+        return False
+    s_low = s.lower()
+    if _is_placeholder_token(s_low):
+        return False
+    if re.match(r"^component\s*\d*$", s_low):
+        return False
+    if s_low in {"component", "comp", "hbd", "hba", "donor", "acceptor"}:
+        return False
+    return True
+
+
+def _is_valid_role(x: Any) -> bool:
+    s = _as_clean_str(x)
+    if not s:
+        return False
+    s_low = s.lower()
+    if _is_placeholder_token(s_low):
+        return False
+    # Allow common role tokens (HBD/HBA/neutral/modifier/etc.).
+    return True
+
+
+def _is_valid_free_text(x: Any) -> bool:
+    s = _as_clean_str(x)
+    if not s:
+        return False
+    if _is_placeholder_token(s):
+        return False
+    return True
+
+
+def _is_valid_ratio(x: Any) -> bool:
+    s = _as_clean_str(x)
+    if not s:
+        return False
+    if _is_placeholder_token(s):
+        return False
+    return True
 
 
 def summarize_formulation(formulation: Any) -> str:
@@ -123,12 +192,17 @@ def validate_formulation(
         return False, errors
 
     if expected_num_components == 2:
-        if not _is_nonempty_nonunknown(formulation.get("HBD")):
-            errors.append("missing/empty HBD")
-        if not _is_nonempty_nonunknown(formulation.get("HBA")):
-            errors.append("missing/empty HBA")
-        if not _is_nonempty_nonunknown(formulation.get("molar_ratio")):
-            errors.append("missing/empty molar_ratio")
+        if not _is_valid_component_name(formulation.get("HBD")):
+            errors.append("missing/invalid HBD")
+        if not _is_valid_component_name(formulation.get("HBA")):
+            errors.append("missing/invalid HBA")
+        ratio = formulation.get("molar_ratio")
+        if not _is_valid_ratio(ratio):
+            errors.append("missing/invalid molar_ratio")
+        else:
+            ratio_s = _as_clean_str(ratio)
+            if ratio_s.count(":") != 1:
+                errors.append("molar_ratio must have exactly 1 ':' separator for binary DES")
         return (len(errors) == 0), errors
 
     # Multi-component
@@ -144,16 +218,16 @@ def validate_formulation(
         if not isinstance(c, dict):
             errors.append(f"component[{idx}] is not an object")
             continue
-        if not _is_nonempty_nonunknown(c.get("name")):
-            errors.append(f"component[{idx}].name missing/empty")
-        if not _is_nonempty_nonunknown(c.get("role")):
-            errors.append(f"component[{idx}].role missing/empty")
-        if require_functions and not _is_nonempty_nonunknown(c.get("function")):
-            errors.append(f"component[{idx}].function missing/empty")
+        if not _is_valid_component_name(c.get("name")):
+            errors.append(f"component[{idx}].name missing/invalid")
+        if not _is_valid_role(c.get("role")):
+            errors.append(f"component[{idx}].role missing/invalid")
+        if require_functions and not _is_valid_free_text(c.get("function")):
+            errors.append(f"component[{idx}].function missing/invalid")
 
     ratio = formulation.get("molar_ratio")
-    if not _is_nonempty_nonunknown(ratio):
-        errors.append("missing/empty molar_ratio")
+    if not _is_valid_ratio(ratio):
+        errors.append("missing/invalid molar_ratio")
     else:
         # Optional structure check: for N components, ratio should have N-1 colons.
         ratio_s = _as_clean_str(ratio)
@@ -173,4 +247,3 @@ def validate_formulation(
             errors.append("num_components is not an integer")
 
     return (len(errors) == 0), errors
-

@@ -40,6 +40,13 @@ from .utils.formulation_validation import (
     validate_formulation,
     summarize_formulation,
 )
+from .utils.formulation_signature import (
+    BaselineRecord,
+    compute_formulation_signature,
+    normalize_material_name,
+    normalize_temperature_C,
+)
+from .utils.candidate_acceptance import evaluate_candidate_acceptance
 
 logger = logging.getLogger(__name__)
 
@@ -472,12 +479,18 @@ Output JSON:
                 task,
                 knowledge_state["memories"] or [],
                 knowledge_state["theory_knowledge"],
-                knowledge_state["literature_knowledge"]
+                knowledge_state["literature_knowledge"],
+                baselines=(knowledge_state.get("baselines") or []),
             )
 
             knowledge_state["formulation_candidates"].append(formulation)
             diag = formulation.get("_diagnostics") if isinstance(formulation, dict) else None
             valid = bool(diag.get("validation_ok")) if isinstance(diag, dict) else False
+            acc = formulation.get("_acceptance") if isinstance(formulation, dict) else None
+            accepted = bool(acc.get("accepted")) if isinstance(acc, dict) else False
+            rec_class = str(acc.get("recommendation_class")) if isinstance(acc, dict) else "N/A"
+            reasons = acc.get("reasons") if isinstance(acc, dict) else []
+            reasons_short = ", ".join([str(r) for r in (reasons or [])[:2]]) if reasons else ""
             formulation_summary = summarize_formulation(
                 (formulation or {}).get("formulation") if isinstance(formulation, dict) else None
             )
@@ -487,7 +500,10 @@ Output JSON:
                 "data": formulation,
                 "summary": (
                     f"Generated formulation: {formulation_summary} "
-                    f"(confidence: {(formulation or {}).get('confidence', 0):.2f}, valid={valid})"
+                    f"(confidence: {(formulation or {}).get('confidence', 0):.2f}, valid={valid}, "
+                    f"accepted={accepted}, class={rec_class}"
+                    + (f", reasons={reasons_short}" if (not accepted and reasons_short) else "")
+                    + ")"
                 ),
             }
 
@@ -501,12 +517,18 @@ Output JSON:
                 task,
                 knowledge_state["memories"] or [],
                 knowledge_state["theory_knowledge"],
-                knowledge_state["literature_knowledge"]
+                knowledge_state["literature_knowledge"],
+                baselines=(knowledge_state.get("baselines") or []),
             )
 
             knowledge_state["formulation_candidates"].append(formulation)
             diag = formulation.get("_diagnostics") if isinstance(formulation, dict) else None
             valid = bool(diag.get("validation_ok")) if isinstance(diag, dict) else False
+            acc = formulation.get("_acceptance") if isinstance(formulation, dict) else None
+            accepted = bool(acc.get("accepted")) if isinstance(acc, dict) else False
+            rec_class = str(acc.get("recommendation_class")) if isinstance(acc, dict) else "N/A"
+            reasons = acc.get("reasons") if isinstance(acc, dict) else []
+            reasons_short = ", ".join([str(r) for r in (reasons or [])[:2]]) if reasons else ""
             formulation_summary = summarize_formulation(
                 (formulation or {}).get("formulation") if isinstance(formulation, dict) else None
             )
@@ -516,7 +538,10 @@ Output JSON:
                 "data": formulation,
                 "summary": (
                     f"Refined formulation: {formulation_summary} "
-                    f"(now have {len(knowledge_state['formulation_candidates'])} candidates, valid={valid})"
+                    f"(now have {len(knowledge_state['formulation_candidates'])} candidates, valid={valid}, "
+                    f"accepted={accepted}, class={rec_class}"
+                    + (f", reasons={reasons_short}" if (not accepted and reasons_short) else "")
+                    + ")"
                 ),
             }
 
@@ -687,6 +712,100 @@ Output JSON:
 
         return formatted
 
+    # ===== P2.2: Baselines + acceptance (delta requirement) =====
+
+    def _collect_relevant_baselines(
+        self, task: Dict[str, Any], *, expected_num_components: int
+    ) -> List[BaselineRecord]:
+        """
+        Collect relevant validated baselines from completed recommendations.
+
+        Baselines are used for:
+        - Delta requirement (LLM must explain the change vector vs a baseline)
+        - Detecting baseline repeats (signature match)
+        - Acceptance gating and early stopping
+        """
+        if not getattr(self, "rec_manager", None):
+            return []
+
+        acc_cfg = (self.config.get("agent", {}) or {}).get("acceptance", {}) or {}
+        tol_C = float(acc_cfg.get("temperature_tolerance_C", 0.5))
+
+        task_material_norm = normalize_material_name(task.get("target_material"))
+        task_temp = normalize_temperature_C(task.get("target_temperature"))
+
+        # Snapshot index under lock (avoid holding the lock while reading many files).
+        index_items: List[Tuple[str, Dict[str, Any]]] = []
+        try:
+            lock = getattr(self.rec_manager, "_lock", None)
+            if lock is None:
+                index_items = list(getattr(self.rec_manager, "index", {}).items())
+            else:
+                with lock:
+                    index_items = list(getattr(self.rec_manager, "index", {}).items())
+        except Exception:
+            return []
+
+        baselines: List[BaselineRecord] = []
+        for rec_id, meta in index_items:
+            # Only completed/validated experiments can be baselines.
+            if meta.get("performance_score") is None:
+                continue
+
+            meta_material_norm = normalize_material_name(meta.get("target_material"))
+            if task_material_norm and meta_material_norm and meta_material_norm != task_material_norm:
+                continue
+
+            meta_temp = normalize_temperature_C(meta.get("target_temperature"))
+            if task_temp is not None:
+                # Require comparable temperature; otherwise we risk enforcing delta vs an unrelated baseline.
+                if meta_temp is None:
+                    continue
+                if abs(float(task_temp) - float(meta_temp)) > tol_C:
+                    continue
+
+            rec = self.rec_manager.get_recommendation(rec_id)
+            if not rec or not rec.experiment_result:
+                continue
+
+            max_val: Optional[float] = None
+            max_unit = "%"
+            for m in (rec.experiment_result.measurements or []):
+                if m.get("leaching_efficiency") is None:
+                    continue
+                try:
+                    v = float(m.get("leaching_efficiency"))
+                except Exception:
+                    continue
+                if max_val is None or v > max_val:
+                    max_val = v
+                    max_unit = str(m.get("unit") or "%").strip() or "%"
+
+            formulation_summary = summarize_formulation(rec.formulation)
+            sig = compute_formulation_signature(rec.formulation, expected_num_components)
+
+            baselines.append(
+                BaselineRecord(
+                    baseline_id=rec_id,
+                    signature=sig,
+                    target_material_norm=normalize_material_name(rec.task.get("target_material")),
+                    target_temperature_C=normalize_temperature_C(rec.task.get("target_temperature")),
+                    max_efficiency_value=max_val,
+                    max_efficiency_unit=max_unit,
+                    formulation_summary=formulation_summary,
+                )
+            )
+
+        # Sort for prompt readability (best first). Percent-like units dominate our current tasks.
+        def _score(b: BaselineRecord) -> float:
+            try:
+                return float(b.max_efficiency_value or 0.0)
+            except Exception:
+                return 0.0
+
+        baselines.sort(key=_score, reverse=True)
+        return baselines
+
     # ===== P2: Action policy helpers (query budgets + anti-parallel default) =====
 
     @staticmethod
@@ -753,6 +872,18 @@ Output JSON:
                 n += 1
         return n
 
+    @staticmethod
+    def _count_accepted_candidates(candidates: List[Any]) -> int:
+        """Count candidates that passed deterministic acceptance checks."""
+        n = 0
+        for cand in candidates or []:
+            if not isinstance(cand, dict):
+                continue
+            acc = cand.get("_acceptance")
+            if isinstance(acc, dict) and bool(acc.get("accepted")):
+                n += 1
+        return n
+
     def _apply_think_policy(
         self,
         thought: Dict[str, Any],
@@ -788,6 +919,9 @@ Output JSON:
             knowledge_state.get("formulation_candidates") or [],
             expected_num_components,
         )
+        num_accepted = self._count_accepted_candidates(
+            knowledge_state.get("formulation_candidates") or []
+        )
 
         remaining = max_iterations - iteration
         stagnating = self._is_stagnating(knowledge_state.get("observations") or [])
@@ -804,11 +938,11 @@ Output JSON:
 
         info_sufficient = bool(last_obs.get("information_sufficient")) if isinstance(last_obs, dict) else False
 
-        # 1) If we already have a valid candidate and info is sufficient -> finish now.
-        if num_valid > 0 and info_sufficient:
+        # 1) If we already have an ACCEPTED candidate and info is sufficient -> finish now.
+        if num_accepted > 0 and info_sufficient:
             thought["action"] = "finish"
             thought["reasoning"] = (
-                "Policy: information is sufficient and a schema-valid formulation exists; finishing early.\n"
+                "Policy: information is sufficient and an ACCEPTED formulation exists; finishing early.\n"
                 + str(thought.get("reasoning") or "").strip()
             ).strip()
             return thought
@@ -816,6 +950,11 @@ Output JSON:
         original_action = str(thought.get("action") or "").strip()
         action = original_action
         override_reason: Optional[str] = None
+
+        # 1.5) Never finish unless an ACCEPTED candidate exists.
+        if action == "finish" and num_accepted == 0:
+            action = "generate_formulation" if num_candidates == 0 else "refine_formulation"
+            override_reason = "No ACCEPTED candidate exists; cannot finish yet."
 
         # 2) Enforce query budgets (CoreRAG/LargeRAG/parallel).
         if action == "query_theory" and num_theory >= max_corerag:
@@ -853,9 +992,9 @@ Output JSON:
             if num_candidates == 0:
                 action = "generate_formulation"
                 override_reason = "Stagnation detected (repeating information gaps); stop querying and generate a candidate."
-            elif num_valid > 0:
+            elif num_accepted > 0:
                 action = "finish"
-                override_reason = "Stagnation detected and a valid candidate exists; finishing early."
+                override_reason = "Stagnation detected and an ACCEPTED candidate exists; finishing early."
             else:
                 action = "refine_formulation"
                 override_reason = "Stagnation detected; refine candidates instead of more searching."
@@ -1015,6 +1154,15 @@ Output JSON:
         task_id = task.get("task_id", f"task_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
         logger.info(f"[ReAct Agent] Starting task {task_id}: {task['description'][:50]}...")
 
+        # Fix the expected component count early so policies/baselines use the same value.
+        agent_cfg = self.config.get("agent", {}) or {}
+        default_num_components = int(agent_cfg.get("default_num_components", 2) or 2)
+        try:
+            expected_num_components = int(task.get("num_components") or default_num_components)
+        except Exception:
+            expected_num_components = default_num_components
+        task["num_components"] = expected_num_components
+
         # Initialize knowledge state
         knowledge_state = {
             "memories": None,
@@ -1030,6 +1178,11 @@ Output JSON:
             "failed_theory_attempts": 0,  # NEW: Track failed CoreRAG attempts
             "failed_literature_attempts": 0,  # NEW: Track failed LargeRAG attempts
         }
+
+        # P2.2: Relevant baselines for delta requirement + acceptance gating.
+        knowledge_state["baselines"] = self._collect_relevant_baselines(
+            task, expected_num_components=expected_num_components
+        )
 
         # Initialize trajectory tracking
         trajectory_steps = []
@@ -1104,22 +1257,20 @@ Output JSON:
             # stop looping and finalize. This preserves research quality while avoiding
             # redundant tool calls (especially CoreRAG).
             if bool(self.config.get("agent", {}).get("allow_early_stopping", True)):
-                expected_num_components = int(task.get("num_components") or 2)
-                num_valid = self._count_valid_candidates(
-                    knowledge_state.get("formulation_candidates") or [],
-                    expected_num_components,
+                num_accepted = self._count_accepted_candidates(
+                    knowledge_state.get("formulation_candidates") or []
                 )
                 stagnating = self._is_stagnating(knowledge_state.get("observations") or [])
                 remaining = max_iterations - iteration
 
-                if num_valid > 0 and (
+                if num_accepted > 0 and (
                     bool(observation.get("information_sufficient"))
                     or stagnating
                     or remaining <= 1
                 ):
                     logger.info(
-                        "[Policy] Early stopping: valid formulation exists and information is sufficient/stalled (valid=%s, suff=%s, stagnating=%s, remaining=%s).",
-                        num_valid,
+                        "[Policy] Early stopping: ACCEPTED formulation exists and information is sufficient/stalled (accepted=%s, suff=%s, stagnating=%s, remaining=%s).",
+                        num_accepted,
                         bool(observation.get("information_sufficient")),
                         stagnating,
                         remaining,
@@ -1143,13 +1294,15 @@ Output JSON:
                 task,
                 knowledge_state["memories"] or [],
                 knowledge_state["theory_knowledge"],
-                knowledge_state["literature_knowledge"]
+                knowledge_state["literature_knowledge"],
+                baselines=(knowledge_state.get("baselines") or []),
             )
             knowledge_state["formulation_candidates"] = [cand0]
 
         # Select the best VALID candidate (do not blindly pick [0]).
         candidate_summaries: List[Dict[str, Any]] = []
         valid_candidates: List[Tuple[float, int, Dict[str, Any]]] = []
+        accepted_candidates: List[Tuple[float, int, Dict[str, Any]]] = []
 
         for idx, cand in enumerate(knowledge_state["formulation_candidates"], start=1):
             if not isinstance(cand, dict):
@@ -1175,30 +1328,57 @@ Output JSON:
                 conf = 0.0
 
             summary = summarize_formulation(f_norm)
+            acc = cand.get("_acceptance") if isinstance(cand, dict) else None
+            accepted = bool(acc.get("accepted")) if isinstance(acc, dict) else False
+            rec_class = str(acc.get("recommendation_class")) if isinstance(acc, dict) else "N/A"
+            acc_reasons = acc.get("reasons") if isinstance(acc, dict) else []
             candidate_summaries.append(
                 {
                     "index": idx,
                     "valid": ok_f,
+                    "accepted": accepted,
+                    "recommendation_class": rec_class,
                     "confidence": conf,
                     "summary": summary,
                     "errors": f_errors,
+                    "acceptance_reasons": acc_reasons,
                 }
             )
 
             if ok_f:
                 valid_candidates.append((conf, idx, cand))
+                if accepted:
+                    accepted_candidates.append((conf, idx, cand))
 
         selected_candidate_index: Optional[int] = None
         final_status = "FAILED"
         outcome = "failed_generation"
 
-        if valid_candidates:
+        if accepted_candidates:
             # Prefer higher confidence; tie-breaker: later candidate (refinement) wins.
             _, selected_candidate_index, formulation_result = max(
-                valid_candidates, key=lambda t: (t[0], t[1])
+                accepted_candidates, key=lambda t: (t[0], t[1])
             )
             final_status = "PENDING"
             outcome = "pending_experiment"
+        elif valid_candidates:
+            # Schema-valid but rejected by acceptance policy (e.g., missing delta_to_baseline).
+            _, selected_candidate_index, formulation_result = max(
+                valid_candidates, key=lambda t: (t[0], t[1])
+            )
+            final_status = "FAILED"
+            outcome = "rejected_by_acceptance"
+
+            acc = formulation_result.get("_acceptance") if isinstance(formulation_result, dict) else None
+            reasons = acc.get("reasons") if isinstance(acc, dict) else []
+            reasons_text = ", ".join([str(r) for r in (reasons or [])]) if reasons else "unknown"
+            formulation_result = dict(formulation_result)
+            formulation_result.setdefault("reasoning", "")
+            formulation_result["reasoning"] = (
+                "ACCEPTANCE CHECK FAILED:\n"
+                f"- reasons: {reasons_text}\n\n"
+                + str(formulation_result.get("reasoning") or "")
+            ).strip()
         else:
             # No valid candidate: persist a FAILED recommendation with diagnostic reasoning.
             formulation_result = (
@@ -1565,7 +1745,8 @@ Output ONLY the query text (no JSON, no explanation):"""
         task: Dict,
         memories: List[MemoryItem],
         theory_list: List[Dict],  # Changed: Now a list of all theory queries
-        literature_list: List[Dict]  # Changed: Now a list of all literature queries
+        literature_list: List[Dict],  # Changed: Now a list of all literature queries
+        baselines: Optional[List[BaselineRecord]] = None,
     ) -> Dict:
         """
         Generate DES formulation using LLM with all available knowledge.
@@ -1579,10 +1760,16 @@ Output ONLY the query text (no JSON, no explanation):"""
         Returns:
             Dict with formulation, reasoning, confidence, etc.
         """
-        # Build comprehensive prompt
-        prompt = self._build_formulation_prompt(task, memories, theory_list, literature_list)
-
         expected_num_components = int(task.get("num_components") or 2)
+        if baselines is None:
+            baselines = self._collect_relevant_baselines(
+                task, expected_num_components=expected_num_components
+            )
+
+        # Build comprehensive prompt (inject baselines when available)
+        prompt = self._build_formulation_prompt(
+            task, memories, theory_list, literature_list, baselines=(baselines or [])
+        )
 
         # Prefer OpenAI's official structured outputs when available.
         # Priority:
@@ -1744,6 +1931,8 @@ Output ONLY the query text (no JSON, no explanation):"""
             cand.setdefault("reasoning", "")
             cand.setdefault("confidence", 0.0)
             cand.setdefault("supporting_evidence", [])
+            cand.setdefault("baseline_reference", "none")
+            cand.setdefault("delta_to_baseline", [])
 
             # Normalize types for downstream UI/persistence.
             cand["formulation"] = normalize_formulation(
@@ -1798,6 +1987,38 @@ Output ONLY the query text (no JSON, no explanation):"""
             else:
                 cand["supporting_evidence"] = [str(x) for x in ev if x is not None]
 
+            # Normalize baseline fields (acceptance gating happens later).
+            try:
+                cand["baseline_reference"] = str(cand.get("baseline_reference") or "none").strip() or "none"
+            except Exception:
+                cand["baseline_reference"] = "none"
+                notes.append("baseline_reference must be a string (normalized to 'none')")
+
+            delta_raw = cand.get("delta_to_baseline")
+            if delta_raw is None:
+                delta_list = []
+            elif isinstance(delta_raw, list):
+                delta_list = delta_raw
+            else:
+                delta_list = [delta_raw]
+
+            delta_norm: List[Dict[str, str]] = []
+            for item in delta_list:
+                if isinstance(item, dict):
+                    change = str(item.get("change") or "").strip()
+                    rationale = str(item.get("rationale") or "").strip()
+                    delta_norm.append({"change": change, "rationale": rationale})
+                else:
+                    delta_norm.append({"change": str(item).strip(), "rationale": ""})
+            cand["delta_to_baseline"] = delta_norm
+
+            # If delta entries exist, require them to be non-empty (schema-quality guard).
+            for i, d in enumerate(delta_norm):
+                if not str(d.get("change") or "").strip():
+                    fatal_errors.append(f"delta_to_baseline[{i}].change missing/empty")
+                if not str(d.get("rationale") or "").strip():
+                    fatal_errors.append(f"delta_to_baseline[{i}].rationale missing/empty")
+
             return {"candidate": cand, "fatal_errors": fatal_errors, "notes": notes}
 
         primary_strategy = "tool_call" if tool_spec is not None else ("response_format" if response_format is not None else "text")
@@ -1825,7 +2046,9 @@ Output ONLY the query text (no JSON, no explanation):"""
                     "- HBA: component name\n"
                     "- molar_ratio: use ':' separators and match HBD:HBA order\n"
                     "- reasoning: 3-6 sentences\n"
-                    "- supporting_evidence: 3-8 one-line bullets\n\n"
+                    "- supporting_evidence: 3-8 one-line bullets\n"
+                    "- baseline_reference: baseline id if provided, else 'none'\n"
+                    "- delta_to_baseline: 2-4 bullets describing how this differs from baseline (if baseline_reference != none)\n\n"
                     "Output format (STRICT):\n"
                     "CANDIDATE:\n"
                     "HBD: ...\n"
@@ -1835,6 +2058,10 @@ Output ONLY the query text (no JSON, no explanation):"""
                     "supporting_evidence:\n"
                     "- ...\n"
                     "- ...\n"
+                    "baseline_reference: ...\n"
+                    "delta_to_baseline:\n"
+                    "- change=... | rationale=...\n"
+                    "- change=... | rationale=...\n"
                 )
             else:
                 draft_prompt = (
@@ -1850,7 +2077,9 @@ Output ONLY the query text (no JSON, no explanation):"""
                     "- molar_ratio: use ':' separators and match the component order\n"
                     "- reasoning: 4-8 sentences\n"
                     "- supporting_evidence: 3-8 one-line bullets\n"
-                    "- synergy_explanation: 3-6 sentences\n\n"
+                    "- synergy_explanation: 3-6 sentences\n"
+                    "- baseline_reference: baseline id if provided, else 'none'\n"
+                    "- delta_to_baseline: 2-4 bullets describing how this differs from baseline (if baseline_reference != none)\n\n"
                     "Output format (STRICT):\n"
                     "CANDIDATE:\n"
                     "components:\n"
@@ -1862,6 +2091,10 @@ Output ONLY the query text (no JSON, no explanation):"""
                     "supporting_evidence:\n"
                     "- ...\n"
                     "- ...\n"
+                    "baseline_reference: ...\n"
+                    "delta_to_baseline:\n"
+                    "- change=... | rationale=...\n"
+                    "- change=... | rationale=...\n"
                 )
 
             draft_output = self.llm_client(
@@ -1902,6 +2135,8 @@ Output ONLY the query text (no JSON, no explanation):"""
                 "- molar_ratio MUST have exactly 1 ':' separator (HBD:HBA).\n"
                 "- reasoning MUST be a non-empty string.\n"
                 "- supporting_evidence MUST be a JSON array of strings.\n"
+                "- baseline_reference MUST be a string (use a provided baseline id if available, else 'none').\n"
+                "- delta_to_baseline MUST be a JSON array of objects with fields: change (string), rationale (string).\n"
                 "- Do NOT introduce components not present in the draft.\n"
                 "- Output ONLY the final structured object; no extra text.\n\n"
                 "Draft:\n"
@@ -1918,6 +2153,8 @@ Output ONLY the query text (no JSON, no explanation):"""
                 f"- molar_ratio MUST have {expected_num_components - 1} ':' separators.\n"
                 "- synergy_explanation MUST be a non-empty string.\n"
                 "- supporting_evidence MUST be a JSON array of strings.\n"
+                "- baseline_reference MUST be a string (use a provided baseline id if available, else 'none').\n"
+                "- delta_to_baseline MUST be a JSON array of objects with fields: change (string), rationale (string).\n"
                 "- Do NOT invent new components not present in the draft.\n"
                 "- If a required field is missing for an existing component, fill it in conservatively.\n"
                 "- Output ONLY the final structured object; no extra text.\n\n"
@@ -1993,6 +2230,37 @@ Output ONLY the query text (no JSON, no explanation):"""
 
         # Attach diagnostics (kept out of the prompt; safe for persistence).
         cand["_diagnostics"] = diagnostics
+
+        # P2.2: Determine acceptance (delta requirement + baseline repeat detection).
+        try:
+            acc_cfg = (self.config.get("agent", {}) or {}).get("acceptance", {}) or {}
+            acc = evaluate_candidate_acceptance(
+                cand,
+                task=task,
+                expected_num_components=expected_num_components,
+                baselines=(baselines or []),
+                schema_valid=bool(diagnostics.get("validation_ok")),
+                baseline_min_percent=float(acc_cfg.get("baseline_min_percent", 80.0)),
+                temperature_tolerance_C=float(acc_cfg.get("temperature_tolerance_C", 0.5)),
+                require_delta_when_baseline_exists=bool(
+                    acc_cfg.get("require_delta_when_baseline_exists", True)
+                ),
+            )
+            # Keep top-level fields consistent with the acceptance decision (for UI + persistence).
+            cand["baseline_reference"] = acc.baseline_reference
+            cand["delta_to_baseline"] = acc.delta_to_baseline
+            cand["_acceptance"] = {
+                "accepted": acc.accepted,
+                "recommendation_class": acc.recommendation_class,
+                "baseline_reference": acc.baseline_reference,
+                "delta_to_baseline": acc.delta_to_baseline,
+                "reasons": acc.reasons,
+                "candidate_signature": acc.candidate_signature,
+                "matched_baseline_id": acc.matched_baseline_id,
+            }
+        except Exception as e:
+            logger.warning("[Acceptance] Failed to evaluate candidate acceptance: %s", str(e))
+
         return cand
 
     def _build_formulation_parameters_schema(
@@ -2001,6 +2269,16 @@ Output ONLY the query text (no JSON, no explanation):"""
         """Build a JSON Schema for the formulation output object."""
         if expected_num_components < 2:
             return None
+
+        delta_item = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "change": {"type": "string"},
+                "rationale": {"type": "string"},
+            },
+            "required": ["change", "rationale"],
+        }
 
         if expected_num_components == 2:
             return {
@@ -2020,8 +2298,17 @@ Output ONLY the query text (no JSON, no explanation):"""
                     "reasoning": {"type": "string"},
                     "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
                     "supporting_evidence": {"type": "array", "items": {"type": "string"}},
+                    "baseline_reference": {"type": "string"},
+                    "delta_to_baseline": {"type": "array", "items": delta_item},
                 },
-                "required": ["formulation", "reasoning", "confidence", "supporting_evidence"],
+                "required": [
+                    "formulation",
+                    "reasoning",
+                    "confidence",
+                    "supporting_evidence",
+                    "baseline_reference",
+                    "delta_to_baseline",
+                ],
             }
 
         component_item = {
@@ -2058,6 +2345,8 @@ Output ONLY the query text (no JSON, no explanation):"""
                 "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
                 "supporting_evidence": {"type": "array", "items": {"type": "string"}},
                 "synergy_explanation": {"type": "string"},
+                "baseline_reference": {"type": "string"},
+                "delta_to_baseline": {"type": "array", "items": delta_item},
             },
             "required": [
                 "formulation",
@@ -2065,6 +2354,8 @@ Output ONLY the query text (no JSON, no explanation):"""
                 "confidence",
                 "supporting_evidence",
                 "synergy_explanation",
+                "baseline_reference",
+                "delta_to_baseline",
             ],
         }
 
@@ -2137,9 +2428,9 @@ Output ONLY the query text (no JSON, no explanation):"""
         """
         if expected_num_components == 2:
             schema_hint = (
-                "Return JSON with keys: formulation(HBD,HBA,molar_ratio), reasoning, confidence, supporting_evidence.\n"
+                "Return JSON with keys: formulation(HBD,HBA,molar_ratio), reasoning, confidence, supporting_evidence, baseline_reference, delta_to_baseline.\n"
                 "Template:\n"
-                '{"formulation":{"HBD":"...","HBA":"...","molar_ratio":"..."},"reasoning":"...","confidence":0.0,"supporting_evidence":["..."]}\n'
+                '{"formulation":{"HBD":"...","HBA":"...","molar_ratio":"..."},"reasoning":"...","confidence":0.0,"supporting_evidence":["..."],"baseline_reference":"none","delta_to_baseline":[{"change":"...","rationale":"..."}]}\n'
             )
         else:
             ratio_example = ":".join(["1"] * expected_num_components)
@@ -2153,7 +2444,7 @@ Output ONLY the query text (no JSON, no explanation):"""
             schema_hint = (
                 f"- Must be exactly {expected_num_components} components.\n"
                 f"- molar_ratio must have {expected_num_components - 1} ':' separators.\n"
-                "Return JSON with keys: formulation(components,molar_ratio,num_components), reasoning, confidence, supporting_evidence, synergy_explanation.\n"
+                "Return JSON with keys: formulation(components,molar_ratio,num_components), reasoning, confidence, supporting_evidence, synergy_explanation, baseline_reference, delta_to_baseline.\n"
                 "Template:\n"
                 "{\n"
                 '  "formulation": {\n'
@@ -2166,7 +2457,9 @@ Output ONLY the query text (no JSON, no explanation):"""
                 '  "reasoning": "...",\n'
                 '  "confidence": 0.0,\n'
                 '  "supporting_evidence": ["..."],\n'
-                '  "synergy_explanation": "..." \n'
+                '  "synergy_explanation": "...",\n'
+                '  "baseline_reference": "none",\n'
+                '  "delta_to_baseline": [{"change":"...","rationale":"..."}]\n'
                 "}\n"
             )
 
@@ -2195,7 +2488,8 @@ Your previous output:
         task: Dict,
         memories: List[MemoryItem],
         theory_list: List[Dict],  # Changed
-        literature_list: List[Dict]  # Changed
+        literature_list: List[Dict],  # Changed
+        baselines: Optional[List[BaselineRecord]] = None,
     ) -> str:
         """
         Build comprehensive prompt for formulation generation.
@@ -2205,6 +2499,7 @@ Your previous output:
             memories: Retrieved memories
             theory_list: List of theory knowledge
             literature_list: List of literature knowledge
+            baselines: Completed experimental baselines relevant to the task (optional)
 
         Returns:
             Formatted prompt string
@@ -2221,6 +2516,27 @@ Your previous output:
             prompt += f"**Constraints:** {constraints}\n"
 
         prompt += "\n"
+
+        # Inject relevant baselines (validated experiments) for delta requirement.
+        baselines = baselines or []
+        if baselines:
+            prompt += "## Validated Baselines (Completed Experiments)\n\n"
+            prompt += (
+                "These are prior tested formulations under similar target conditions.\n"
+                "When proposing a **RECOMMENDATION**, you MUST set `baseline_reference` to one of these IDs "
+                "and provide a non-empty `delta_to_baseline` change vector.\n\n"
+            )
+
+            for b in baselines[:5]:
+                eff = (
+                    f"{b.max_efficiency_value} {b.max_efficiency_unit}".strip()
+                    if b.max_efficiency_value is not None
+                    else "N/A"
+                )
+                t = f"{b.target_temperature_C} °C" if b.target_temperature_C is not None else "N/A"
+                summary = b.formulation_summary or "<unavailable summary>"
+                prompt += f"- {b.baseline_id}: {summary} | max_leaching_efficiency≈{eff} | T≈{t}\n"
+            prompt += "\n"
 
         # Inject memories
         if memories:
@@ -2254,6 +2570,8 @@ Based on the above information, design a **binary DES formulation** (2 component
 4. **Reasoning**: Explain your design choices (2-3 sentences)
 5. **Confidence**: 0.0 to 1.0
 6. **Supporting Evidence**: List key facts from memory/theory/literature
+7. **Baseline Reference**: If a relevant validated baseline exists, reference it by ID; otherwise "none"
+8. **Delta to Baseline**: If baseline_reference != "none", provide 2-4 structured change entries relative to that baseline
 
 Format your response as JSON:
 ```json
@@ -2265,7 +2583,11 @@ Format your response as JSON:
     },
     "reasoning": "...",
     "confidence": 0.0,
-    "supporting_evidence": ["...", "..."]
+    "supporting_evidence": ["...", "..."],
+    "baseline_reference": "none",
+    "delta_to_baseline": [
+        {"change": "...", "rationale": "..."}
+    ]
 }
 ```
 """
@@ -2281,6 +2603,8 @@ Based on the above information, design a **{num_components}-component DES formul
 4. **Confidence**: 0.0 to 1.0
 5. **Supporting Evidence**: List key facts from memory/theory/literature. Left empty if none.
 6. **Synergy Explanation**: How do the multiple components work together?
+7. **Baseline Reference**: If a relevant validated baseline exists, reference it by ID; otherwise "none"
+8. **Delta to Baseline**: If baseline_reference != "none", provide 2-4 structured change entries relative to that baseline
 
 Format your response as JSON:
 ```json
@@ -2297,7 +2621,11 @@ Format your response as JSON:
     "reasoning": "...",
     "confidence": 0.0,
     "supporting_evidence": ["...", "..."],
-    "synergy_explanation": "Component X and Y synergistically..."
+    "synergy_explanation": "Component X and Y synergistically...",
+    "baseline_reference": "none",
+    "delta_to_baseline": [
+        {{"change": "...", "rationale": "..."}}
+    ]
 }}
 ```
 

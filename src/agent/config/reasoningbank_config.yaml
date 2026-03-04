@@ -115,5 +115,14 @@ agent:
   structured_temperature: 0.0
   structured_max_tokens: 1800
 
+  # Candidate acceptance (P0/P2)
+  # - Baseline repeats are detected via formulation signatures.
+  # - A baseline repeat may still be accepted if it is proven strong (>= baseline_min_percent).
+  # - If a relevant baseline exists, RECOMMENDATION candidates must provide delta_to_baseline.
+  acceptance:
+    baseline_min_percent: 80.0
+    temperature_tolerance_C: 0.5
+    require_delta_when_baseline_exists: true
+
   # Deprecated (use max_iterations instead)
   # max_steps: 10
