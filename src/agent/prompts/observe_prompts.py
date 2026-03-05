@@ -97,8 +97,8 @@ Respond with ONLY a valid JSON object (no markdown, no explanation):
         "<specific gap 1>",
         "<specific gap 2>"
     ],
-    "information_sufficient": true/false,
-    "stagnation_detected": true/false,
+    "information_sufficient": false,
+    "stagnation_detected": false,
     "recommended_next_action": "<action_name>",
     "recommendation_reasoning": "<1 sentence explaining why this action is recommended>"
 }}
@@ -227,22 +227,20 @@ def parse_observe_output(llm_output: str) -> dict:
     Returns:
         Dict with observation fields
     """
-    import json
-    import re
+    from ..utils.json_extract import loads_json_from_text
 
-    # Try to extract JSON (handle potential markdown wrapping)
-    json_match = re.search(r'```json\s*(.*?)\s*```', llm_output, re.DOTALL)
-    if json_match:
-        try:
-            return json.loads(json_match.group(1))
-        except json.JSONDecodeError:
-            pass
-
-    # Try to parse as direct JSON
-    try:
-        return json.loads(llm_output.strip())
-    except json.JSONDecodeError:
-        pass
+    parsed = loads_json_from_text(llm_output)
+    if isinstance(parsed, dict):
+        # Ensure required keys exist so downstream logging/trajectory never KeyErrors.
+        parsed.setdefault("summary", "No summary provided")
+        parsed.setdefault("knowledge_updated", [])
+        parsed.setdefault("key_insights", [])
+        parsed.setdefault("information_gaps", [])
+        parsed.setdefault("information_sufficient", False)
+        parsed.setdefault("stagnation_detected", False)
+        parsed.setdefault("recommended_next_action", "generate_formulation")
+        parsed.setdefault("recommendation_reasoning", "")
+        return parsed
 
     # Fallback: return minimal structure
     return {
@@ -251,6 +249,7 @@ def parse_observe_output(llm_output: str) -> dict:
         "key_insights": [],
         "information_gaps": [],
         "information_sufficient": False,
+        "stagnation_detected": False,
         "recommended_next_action": "generate_formulation",
-        "recommendation_reasoning": "Fallback action due to parsing error"
+        "recommendation_reasoning": "Fallback action due to parsing error",
     }
