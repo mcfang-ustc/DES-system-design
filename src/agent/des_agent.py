@@ -204,6 +204,11 @@ class DESAgent:
 **Target Temperature**: {task.get('target_temperature', 25)}°C
 **Constraints**: {task.get('constraints', {})}
 
+**Primary Objective (performance-first)**:
+- Aim to propose the **best-performing** DES recommendation for the target conditions (maximize dissolution/leaching efficiency at the target temperature).
+- Do NOT default to the “most conservative / most stable” formulation if it is known or likely to underperform on the target metric.
+- Stability/feasibility matters only insofar as the formulation remains testable under the given constraints.
+
 **Stage**: **{stage}**
 {final_round_note}
 
@@ -480,6 +485,7 @@ Output JSON:
                 knowledge_state["memories"] or [],
                 knowledge_state["theory_knowledge"],
                 knowledge_state["literature_knowledge"],
+                prior_candidates=(knowledge_state.get("formulation_candidates") or []),
                 baselines=(knowledge_state.get("baselines") or []),
             )
 
@@ -518,6 +524,7 @@ Output JSON:
                 knowledge_state["memories"] or [],
                 knowledge_state["theory_knowledge"],
                 knowledge_state["literature_knowledge"],
+                prior_candidates=(knowledge_state.get("formulation_candidates") or []),
                 baselines=(knowledge_state.get("baselines") or []),
             )
 
@@ -1295,6 +1302,7 @@ Output JSON:
                 knowledge_state["memories"] or [],
                 knowledge_state["theory_knowledge"],
                 knowledge_state["literature_knowledge"],
+                prior_candidates=(knowledge_state.get("formulation_candidates") or []),
                 baselines=(knowledge_state.get("baselines") or []),
             )
             knowledge_state["formulation_candidates"] = [cand0]
@@ -1746,6 +1754,7 @@ Output ONLY the query text (no JSON, no explanation):"""
         memories: List[MemoryItem],
         theory_list: List[Dict],  # Changed: Now a list of all theory queries
         literature_list: List[Dict],  # Changed: Now a list of all literature queries
+        prior_candidates: Optional[List[Dict[str, Any]]] = None,
         baselines: Optional[List[BaselineRecord]] = None,
     ) -> Dict:
         """
@@ -1768,7 +1777,12 @@ Output ONLY the query text (no JSON, no explanation):"""
 
         # Build comprehensive prompt (inject baselines when available)
         prompt = self._build_formulation_prompt(
-            task, memories, theory_list, literature_list, baselines=(baselines or [])
+            task,
+            memories,
+            theory_list,
+            literature_list,
+            prior_candidates=(prior_candidates or []),
+            baselines=(baselines or []),
         )
 
         # Prefer OpenAI's official structured outputs when available.
@@ -2134,6 +2148,7 @@ Output ONLY the query text (no JSON, no explanation):"""
                 "- You MUST output formulation.HBD (string), formulation.HBA (string), formulation.molar_ratio (string).\n"
                 "- molar_ratio MUST have exactly 1 ':' separator (HBD:HBA).\n"
                 "- reasoning MUST be a non-empty string.\n"
+                "- confidence MUST be a number in [0.0, 1.0] meaning: confidence this candidate will outperform the best baseline on dissolution/leaching efficiency under the target conditions.\n"
                 "- supporting_evidence MUST be a JSON array of strings.\n"
                 "- baseline_reference MUST be a string (use a provided baseline id if available, else 'none').\n"
                 "- delta_to_baseline MUST be a JSON array of objects with fields: change (string), rationale (string).\n"
@@ -2152,6 +2167,7 @@ Output ONLY the query text (no JSON, no explanation):"""
                 "- Each component MUST have non-empty string fields: name, role, function.\n"
                 f"- molar_ratio MUST have {expected_num_components - 1} ':' separators.\n"
                 "- synergy_explanation MUST be a non-empty string.\n"
+                "- confidence MUST be a number in [0.0, 1.0] meaning: confidence this candidate will outperform the best baseline on dissolution/leaching efficiency under the target conditions.\n"
                 "- supporting_evidence MUST be a JSON array of strings.\n"
                 "- baseline_reference MUST be a string (use a provided baseline id if available, else 'none').\n"
                 "- delta_to_baseline MUST be a JSON array of objects with fields: change (string), rationale (string).\n"
@@ -2489,6 +2505,7 @@ Your previous output:
         memories: List[MemoryItem],
         theory_list: List[Dict],  # Changed
         literature_list: List[Dict],  # Changed
+        prior_candidates: Optional[List[Dict[str, Any]]] = None,
         baselines: Optional[List[BaselineRecord]] = None,
     ) -> str:
         """
@@ -2517,6 +2534,15 @@ Your previous output:
 
         prompt += "\n"
 
+        # Explicit objective: performance-first recommendation (not stability-first).
+        prompt += "## Optimization Objective (Performance-first)\n\n"
+        prompt += (
+            "Your goal is to propose a DES formulation that **maximizes dissolution/leaching performance** "
+            "for the target material at the target temperature.\n"
+            "Do NOT optimize for the safest/most conservative formulation if it sacrifices the target performance.\n"
+            "Use feasibility/stability only as secondary constraints (the formulation must remain testable).\n\n"
+        )
+
         # Inject relevant baselines (validated experiments) for delta requirement.
         baselines = baselines or []
         if baselines:
@@ -2537,6 +2563,18 @@ Your previous output:
                 summary = b.formulation_summary or "<unavailable summary>"
                 prompt += f"- {b.baseline_id}: {summary} | max_leaching_efficiency≈{eff} | T≈{t}\n"
             prompt += "\n"
+
+        # Inject deterministic acceptance feedback from previous attempts (hard constraints).
+        expected_num_components = int(task.get("num_components") or 2)
+        prior_candidates = prior_candidates or []
+        if prior_candidates:
+            feedback = self._format_acceptance_feedback_for_prompt(
+                prior_candidates,
+                baselines=baselines,
+                expected_num_components=expected_num_components,
+            )
+            if feedback:
+                prompt += feedback
 
         # Inject memories
         if memories:
@@ -2568,7 +2606,7 @@ Based on the above information, design a **binary DES formulation** (2 component
 2. **HBA (Hydrogen Bond Acceptor)**: Component name
 3. **Molar Ratio**: e.g., "1:2" (HBD:HBA)
 4. **Reasoning**: Explain your design choices (2-3 sentences)
-5. **Confidence**: 0.0 to 1.0
+5. **Confidence**: 0.0 to 1.0 (your confidence that this formulation will **outperform the best baseline** on dissolution/leaching efficiency under the target conditions)
 6. **Supporting Evidence**: List key facts from memory/theory/literature
 7. **Baseline Reference**: If a relevant validated baseline exists, reference it by ID; otherwise "none"
 8. **Delta to Baseline**: If baseline_reference != "none", provide 2-4 structured change entries relative to that baseline
@@ -2600,7 +2638,7 @@ Based on the above information, design a **{num_components}-component DES formul
 1. **Components**: List of {num_components} components with their roles (HBD/HBA/neutral)
 2. **Molar Ratio**: Ratio between all components (e.g., "1:2:1" for ternary)
 3. **Reasoning**: Explain your design choices, especially why multiple components are beneficial (3-4 sentences)
-4. **Confidence**: 0.0 to 1.0
+4. **Confidence**: 0.0 to 1.0 (your confidence that this formulation will **outperform the best baseline** on dissolution/leaching efficiency under the target conditions)
 5. **Supporting Evidence**: List key facts from memory/theory/literature. Left empty if none.
 6. **Synergy Explanation**: How do the multiple components work together?
 7. **Baseline Reference**: If a relevant validated baseline exists, reference it by ID; otherwise "none"
@@ -2638,6 +2676,154 @@ Format your response as JSON:
 
 
         return prompt
+
+    def _format_acceptance_feedback_for_prompt(
+        self,
+        prior_candidates: List[Dict[str, Any]],
+        *,
+        baselines: List[BaselineRecord],
+        expected_num_components: int,
+    ) -> str:
+        """
+        Build a compact "hard constraints" section from deterministic acceptance failures.
+
+        Goal:
+        - Strongly back-inject why previous candidates failed acceptance, so the next
+          generation is forced away from repeated rejected patterns (e.g., baseline loops).
+
+        Constraints:
+        - Keep this short (prompt budget).
+        - Do not embed raw candidate dicts or diagnostics blobs (can be huge).
+        """
+        if not prior_candidates:
+            return ""
+
+        # Snapshot acceptance config for thresholds we should make explicit to the LLM.
+        acc_cfg = (self.config.get("agent", {}) or {}).get("acceptance", {}) or {}
+        baseline_min_percent = float(acc_cfg.get("baseline_min_percent", 80.0))
+
+        # Only consider the most recent few candidates to avoid bloating context.
+        tail = prior_candidates[-6:]
+        base_index = len(prior_candidates) - len(tail) + 1
+
+        items: List[Dict[str, Any]] = []
+        for offset, cand in enumerate(tail):
+            if not isinstance(cand, dict):
+                continue
+
+            acc = cand.get("_acceptance")
+            if not isinstance(acc, dict):
+                continue
+
+            idx = base_index + offset
+            try:
+                f_norm = normalize_formulation(cand.get("formulation"), expected_num_components)
+            except Exception:
+                f_norm = cand.get("formulation")
+
+            summary = summarize_formulation(f_norm)
+
+            reasons = acc.get("reasons") if isinstance(acc.get("reasons"), list) else []
+            reasons_norm = [str(r) for r in (reasons or []) if r is not None]
+
+            items.append(
+                {
+                    "index": idx,
+                    "accepted": bool(acc.get("accepted")),
+                    "recommendation_class": str(acc.get("recommendation_class") or "N/A"),
+                    "baseline_reference": str(acc.get("baseline_reference") or cand.get("baseline_reference") or "none"),
+                    "matched_baseline_id": acc.get("matched_baseline_id"),
+                    "candidate_signature": acc.get("candidate_signature"),
+                    "summary": summary,
+                    "reasons": reasons_norm,
+                }
+            )
+
+        rejected = [x for x in items if not x.get("accepted")]
+        if not rejected:
+            return ""
+
+        # Collect reason codes observed recently (for derived constraints).
+        reason_set = {r for x in rejected for r in (x.get("reasons") or [])}
+
+        # Identify underperforming baselines implicated by rejections (if any).
+        underperforming_baseline_ids: List[str] = []
+        for x in rejected:
+            if "baseline_underperformed" not in (x.get("reasons") or []):
+                continue
+            mb = x.get("matched_baseline_id")
+            if isinstance(mb, str) and mb.strip():
+                underperforming_baseline_ids.append(mb.strip())
+            else:
+                br = str(x.get("baseline_reference") or "").strip()
+                if br and br.lower() not in {"none", "n/a", "na", "null"}:
+                    underperforming_baseline_ids.append(br)
+
+        under_ids_unique: List[str] = []
+        for bid in underperforming_baseline_ids:
+            if bid not in under_ids_unique:
+                under_ids_unique.append(bid)
+
+        baseline_lines: List[str] = []
+        if under_ids_unique and baselines:
+            by_id = {b.baseline_id: b for b in baselines if getattr(b, "baseline_id", None)}
+            for bid in under_ids_unique[:3]:
+                b = by_id.get(bid)
+                if b is None:
+                    continue
+                eff = (
+                    f"{b.max_efficiency_value}{b.max_efficiency_unit}".strip()
+                    if b.max_efficiency_value is not None
+                    else "N/A"
+                )
+                baseline_lines.append(f"- {b.baseline_id}: {b.formulation_summary} | max_leaching_efficiency≈{eff}")
+
+        # Build the section.
+        lines: List[str] = []
+        lines.append("## Acceptance Feedback (Hard Constraints)\n")
+        lines.append(
+            "Deterministic acceptance checks rejected previous candidates. "
+            "Your next candidate MUST address these failures; otherwise it will be rejected again.\n"
+        )
+
+        # Show the last few rejected attempts (most actionable signal).
+        lines.append("Recent rejections (most recent first):")
+        for x in list(rejected)[-3:][::-1]:
+            reasons_txt = ", ".join(x.get("reasons") or []) or "unknown"
+            lines.append(
+                f"- candidate#{x.get('index')}: class={x.get('recommendation_class')} | "
+                f"{x.get('summary')} | reasons={reasons_txt}"
+            )
+
+        # Derived hard constraints (mapped from reason codes).
+        lines.append("\nHard constraints for the next candidate:")
+
+        if "baseline_underperformed" in reason_set:
+            lines.append(
+                f"- DO NOT output an exact baseline repeat. Baseline repeats are accepted only if the "
+                f"tested max leaching efficiency is ≥ {baseline_min_percent:.1f}% under target conditions."
+            )
+            lines.append(
+                "- Your next candidate MUST differ from the baseline in at least one component identity "
+                "or molar ratio (re-ordering or renaming does NOT count)."
+            )
+            if baseline_lines:
+                lines.append("- Underperforming baselines implicated in recent failures:")
+                lines.extend(baseline_lines)
+
+        if "missing_delta_to_baseline" in reason_set:
+            lines.append(
+                "- A relevant baseline exists: you MUST provide `baseline_reference` pointing to a baseline ID "
+                "AND a non-empty `delta_to_baseline` list (2–4 items), each with both `change` and `rationale`."
+            )
+
+        if "schema_invalid" in reason_set:
+            lines.append(
+                "- Output must strictly match the required JSON schema (fixed component count + required fields)."
+            )
+
+        lines.append("")  # trailing newline
+        return "\n".join(lines)
 
     def _format_corerag_for_prompt(self, theory: Any) -> str:
         """
