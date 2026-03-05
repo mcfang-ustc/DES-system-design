@@ -634,7 +634,18 @@ Output JSON:
 
         # Call LLM for observation analysis
         try:
-            llm_output = self.llm_client(observe_prompt)
+            response_format = None
+            if getattr(self.llm_client, "provider", None) == "openai":
+                response_format = self._build_observe_response_format()
+                if response_format is not None:
+                    logger.info(
+                        "[OBSERVE] Using OpenAI response_format=json_schema strict for structured output."
+                    )
+
+            if response_format is not None:
+                llm_output = self.llm_client(observe_prompt, response_format=response_format)
+            else:
+                llm_output = self.llm_client(observe_prompt)
             observation = parse_observe_output(llm_output)
 
             # Add metadata
@@ -2423,6 +2434,64 @@ Output ONLY the query text (no JSON, no explanation):"""
             "type": "json_schema",
             "json_schema": {
                 "name": "des_formulation_v1",
+                "strict": True,
+                "schema": schema,
+            },
+        }
+
+    @staticmethod
+    def _build_observe_parameters_schema() -> Dict[str, Any]:
+        """
+        JSON Schema for the OBSERVE phase structured output.
+
+        Keep this schema small and permissive enough to work across OpenAI-compatible
+        deployments, but strict enough to prevent non-JSON outputs.
+        """
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "summary": {"type": "string"},
+                "knowledge_updated": {"type": "array", "items": {"type": "string"}},
+                "key_insights": {"type": "array", "items": {"type": "string"}},
+                "information_gaps": {"type": "array", "items": {"type": "string"}},
+                "information_sufficient": {"type": "boolean"},
+                "stagnation_detected": {"type": "boolean"},
+                "recommended_next_action": {
+                    "type": "string",
+                    "enum": [
+                        "retrieve_memories",
+                        "query_theory",
+                        "query_literature",
+                        "query_parallel",
+                        "generate_formulation",
+                        "refine_formulation",
+                        "finish",
+                    ],
+                },
+                "recommendation_reasoning": {"type": "string"},
+            },
+            "required": [
+                "summary",
+                "knowledge_updated",
+                "key_insights",
+                "information_gaps",
+                "information_sufficient",
+                "stagnation_detected",
+                "recommended_next_action",
+                "recommendation_reasoning",
+            ],
+        }
+
+    def _build_observe_response_format(self) -> Optional[Dict[str, Any]]:
+        """Build OpenAI Chat Completions `response_format` for OBSERVE structured outputs."""
+        schema = self._build_observe_parameters_schema()
+        if not schema:
+            return None
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "observe_output_v1",
                 "strict": True,
                 "schema": schema,
             },
