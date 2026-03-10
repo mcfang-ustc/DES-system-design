@@ -70,7 +70,8 @@ class LLMClient:
         # Determine API key and base URL
         if provider == "openai":
             self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-            self.base_url = base_url or "https://api.openai.com/v1"
+            env_base_url = os.getenv("OPENAI_API_BASE") or os.getenv("OPENAI_BASE_URL")
+            self.base_url = base_url or env_base_url or "https://api.openai.com/v1"
 
         elif provider == "dashscope":
             self.api_key = api_key or os.getenv("DASHSCOPE_API_KEY")
@@ -103,7 +104,7 @@ class LLMClient:
 
         logger.info(
             f"Initialized LLM client: provider={provider}, model={model}, "
-            f"temperature={temperature}"
+            f"temperature={temperature}, base_url={self.base_url}"
         )
 
     @staticmethod

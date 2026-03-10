@@ -65,7 +65,9 @@ class AgentLoader:
         try:
             # Load configurations
             web_config = get_web_config()
-            agent_config = get_config()
+            agent_config_path = str(web_config.get_agent_config_path())
+            agent_config = get_config(agent_config_path)
+            logger.info(f"Using agent config: {agent_config.config_path}")
 
             # Create LLM clients from agent config
             llm_config = agent_config.get_llm_config("llm")

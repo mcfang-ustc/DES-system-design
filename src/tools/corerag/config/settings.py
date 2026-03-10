@@ -12,6 +12,7 @@ from owlready2 import onto_path, get_ontology, Ontology, Namespace
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "default_api_key")
+OPENAI_API_BASE = os.getenv("OPENAI_API_BASE") or os.getenv("OPENAI_BASE_URL")
 
 
 path_matcher = re.compile(r'\$\{([^}^{]+)\}')
@@ -53,6 +54,8 @@ with open(config_path, "r", encoding='utf-8') as f:
     if 'PROJECT_ROOT' in os.environ:
         yaml_settings['PROJECT_ROOT'] = os.environ['PROJECT_ROOT']
     yaml_settings = resolve_key_references(yaml_settings)
+    if OPENAI_API_BASE:
+        yaml_settings.setdefault("LLM", {})["openai_api_base"] = OPENAI_API_BASE
 
 # --- Set Java Path Globally (Step 1 - Added) ---
 _ontology_yaml_config = yaml_settings.get("ontology", {}) # Get ontology section safely

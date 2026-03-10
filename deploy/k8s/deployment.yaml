@@ -277,6 +277,8 @@ spec:
               value: "INFO"
             - name: CORS_ORIGINS
               value: "http://localhost,http://127.0.0.1"
+            - name: OPENAI_API_BASE
+              value: "https://api.openai.com/v1"
             - name: DASHSCOPE_API_KEY
               valueFrom:
                 secretKeyRef:
