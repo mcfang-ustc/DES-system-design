@@ -98,6 +98,137 @@ data:
       level: "INFO"
       file_path: "/app/logs/largerag.log"
       format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+  reasoningbank_config.yaml: |-
+    # ReasoningBank Configuration for DES Formulation Agent
+
+    # API Keys Configuration:
+    # - DashScope: Set DASHSCOPE_API_KEY in .env file
+    # - OpenAI: Set OPENAI_API_KEY in .env file
+    # API clients automatically load keys from environment variables
+
+    # LLM Configuration
+    llm:
+      provider: "openai"  # "dashscope" (Aliyun) or "openai" or "custom"
+      model: "gpt-5.2"  # Aux LLM for extractor/judge (keep reasoning off so temperature works)
+      temperature: 0.1
+      max_tokens: 5000
+      # OpenAI-only knobs (safe to keep for other providers; they will be ignored)
+      # reasoning_effort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+      reasoning_effort: "xhigh"
+      api_base: null  # Optional override; OPENAI_API_BASE / OPENAI_BASE_URL env vars take precedence.
+
+    # Agent LLM (may use different model for main reasoning)
+    agent_llm:
+      provider: "openai"
+      model: "gpt-5.2"  # Higher capability for formulation design
+      temperature: 0.1
+      max_tokens: 5000
+      # Enable GPT-5.2 reasoning. When reasoning_effort != "none", the client will
+      # automatically omit incompatible sampling params (temperature/top_p/logprobs).
+      reasoning_effort: "xhigh"
+      api_base: null  # Optional override; OPENAI_API_BASE / OPENAI_BASE_URL env vars take precedence.
+
+    # Embedding Configuration
+    embedding:
+      provider: "dashscope"  # "dashscope" (Aliyun) or "openai"
+      model: "text-embedding-v4"  # DashScope: text-embedding-v3 | OpenAI: text-embedding-3-small
+      dimension: 2048  # Auto-detected. OpenAI supports custom dimensions (e.g., 512, 1536)
+
+    # Memory Bank Configuration
+    memory:
+      max_items: 1000
+      retrieval_top_k: 3  # Number of memories to retrieve per query
+      extraction_max_per_trajectory: 3  # Max memories from single trajectory
+      min_similarity: 0.0  # Minimum similarity threshold (0-1)
+      # Persisted ReasoningBank file. The web backend resolves this relative path
+      # against project root so it lands in the Docker-mounted volume (/app/data).
+      persist_path: "data/memory/reasoning_bank.json"
+      auto_save: true  # Auto-save after each consolidation
+
+    # Async Experimental Feedback Configuration (NEW)
+    recommendations:
+      storage_path: "data/recommendations"  # Directory path for recommendation JSON files
+      auto_create_dirs: true  # Auto-create storage directory if not exists
+
+    # Judge Configuration
+    judge:
+      temperature: 0.0  # Deterministic for consistency
+      use_judge: true  # Whether to use LLM judge (set false for oracle evaluation)
+
+    # Extractor Configuration
+    extractor:
+      temperature: 1.0  # Higher temperature for diverse memory generation
+      use_parallel_extraction: false  # Enable MaTTS parallel extraction
+
+    # Tool Integration
+    tools:
+      corerag:
+        enabled: true
+        max_results: 5
+        timeout: 1000  # seconds
+
+      largerag:
+        enabled: true  # Set to false if not ready
+        max_results: 10
+        timeout: 300
+
+      experimental_data:
+        enabled: false  # Not implemented yet
+
+    # MaTTS (Memory-Aware Test-Time Scaling)
+    matts:
+      enabled: false  # Enable after Phase 4
+      parallel_k: 3  # Number of parallel trajectories
+      sequential_steps: 2  # Number of refinement steps
+      use_self_contrast: true  # Use self-contrast for parallel extraction
+
+    # Logging
+    logging:
+      level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+      log_file: "logs/reasoningbank.log"
+      console: true
+
+    # Agent Behavior (ReAct Loop Configuration)
+    agent:
+      # ReAct Loop Parameters
+      max_iterations: 20  # Maximum ReAct iterations (Think-Act-Observe cycles)
+      enable_memory_injection: true  # Inject retrieved memories into prompt
+      explain_memory_usage: true  # Agent should explain why it uses each memory
+
+      # Planning / Query Policy (P2)
+      # Hard caps to prevent runaway tool usage (especially CoreRAG).
+      # Note: query_parallel consumes BOTH budgets when both tools run.
+      max_corerag_queries: 3
+      max_largerag_queries: 8
+      max_parallel_queries: 3
+
+      # Stopping Conditions
+      auto_finish_threshold: 0.9  # Auto-finish if formulation confidence >= this value
+      allow_early_stopping: true  # Allow LLM to decide "finish" before max_iterations
+
+      # Formulation Design
+      default_num_components: 2  # Default DES type: 2=binary, 3=ternary, 4=quaternary, etc.
+      allow_multi_component: true  # Allow agent to suggest multi-component DES
+
+      # Structured Output Reliability (P0)
+      # Two-stage generation: (1) reasoning draft, (2) strict schema output with reasoning_effort=none.
+      draft_max_tokens: 1400
+      structured_reasoning_effort: "none"
+      structured_temperature: 0.0
+      structured_max_tokens: 1800
+
+      # Candidate acceptance (P0/P2)
+      # - Baseline repeats are detected via formulation signatures.
+      # - A baseline repeat may still be accepted if it is proven strong (>= baseline_min_percent).
+      # - If a relevant baseline exists, RECOMMENDATION candidates must provide delta_to_baseline.
+      acceptance:
+        baseline_min_percent: 80.0
+        temperature_tolerance_C: 0.5
+        require_delta_when_baseline_exists: true
+
+      # Deprecated (use max_iterations instead)
+      # max_steps: 10
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -305,6 +436,10 @@ spec:
             - name: des-backend-config
               mountPath: /app/src/tools/largerag/config/settings.yaml
               subPath: largerag_settings.yaml
+              readOnly: true
+            - name: des-backend-config
+              mountPath: /app/src/agent/config/reasoningbank_config.yaml
+              subPath: reasoningbank_config.yaml
               readOnly: true
           startupProbe:
             httpGet:
