@@ -1232,6 +1232,290 @@ Output JSON:
 
         return ":".join(str(i) for i in ints)
 
+    @staticmethod
+    def _scaled_ratio_ints(
+        molar_ratio: Any, expected_num_components: int
+    ) -> Optional[List[int]]:
+        """Parse molar_ratio into a scale-invariant integer vector.
+
+        Returns:
+        - list[int] of length expected_num_components when successful
+        - None if parsing fails
+        """
+        s = str(molar_ratio or "").strip()
+        if not s:
+            return None
+
+        parts = [p.strip() for p in s.split(":") if p.strip()]
+        n = int(expected_num_components or 0)
+        if n <= 0:
+            return None
+        if len(parts) < n:
+            return None
+        parts = parts[:n]
+
+        fracs: List[Fraction] = []
+        for p in parts:
+            try:
+                f = Fraction(p)
+            except Exception:
+                try:
+                    f = Fraction(str(float(p)))
+                except Exception:
+                    return None
+            f = f.limit_denominator(1000)
+            if f <= 0:
+                return None
+            fracs.append(f)
+
+        den_lcm = 1
+        for f in fracs:
+            den_lcm = den_lcm * f.denominator // math.gcd(den_lcm, f.denominator)
+
+        ints = [int(f.numerator * (den_lcm // f.denominator)) for f in fracs]
+        if any(i <= 0 for i in ints):
+            return None
+
+        g = 0
+        for i in ints:
+            g = math.gcd(g, abs(i))
+        if g:
+            ints = [i // g for i in ints]
+
+        if len(ints) != n:
+            return None
+        return ints
+
+    @staticmethod
+    def _extract_components_norm(
+        formulation: Any, expected_num_components: int
+    ) -> List[str]:
+        """Extract normalized component names from a formulation dict."""
+        if not isinstance(formulation, dict):
+            return []
+
+        if int(expected_num_components or 0) == 2:
+            hbd = normalize_component_name(formulation.get("HBD"))
+            hba = normalize_component_name(formulation.get("HBA"))
+            out = [hbd, hba]
+            return [x for x in out if x]
+
+        comps = formulation.get("components")
+        if not isinstance(comps, list):
+            return []
+
+        out: List[str] = []
+        for c in comps:
+            if isinstance(c, dict):
+                name = c.get("name")
+            else:
+                name = c
+            n = normalize_component_name(name)
+            if n:
+                out.append(n)
+        return out
+
+    def _scaled_formulation_signature(
+        self, formulation: Any, expected_num_components: int
+    ) -> str:
+        """Compute a scale-invariant, order-invariant signature for similarity checks."""
+        if not isinstance(formulation, dict):
+            return ""
+
+        n = int(expected_num_components or 0)
+        if n <= 0:
+            return ""
+
+        comps_norm = self._extract_components_norm(formulation, n)
+        if len(comps_norm) < n:
+            return ""
+
+        ints = self._scaled_ratio_ints(formulation.get("molar_ratio"), n)
+        if not ints:
+            # Fallback to non-scaled signature when ratios are not parseable.
+            return compute_formulation_signature(formulation, n)
+
+        # Map component -> ratio_int in the given order, then sort by component name.
+        # If duplicates exist, sum them to keep signature stable.
+        mapping: Dict[str, int] = {}
+        for name, r in zip(comps_norm[:n], ints[:n]):
+            if not name:
+                continue
+            mapping[name] = int(mapping.get(name, 0)) + int(r)
+
+        if not mapping:
+            return ""
+
+        body = "|".join([f"{k}={mapping[k]}" for k in sorted(mapping.keys())])
+        return f"sig_scaled_v1|n={n}|{body}"
+
+    def _similarity_gate_check(
+        self,
+        candidate_formulation: Any,
+        *,
+        task: Dict[str, Any],
+        expected_num_components: int,
+        prior_candidates: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Deterministic similarity gate to prevent near-duplicate recommendations.
+
+        Returns a dict:
+        - passed: bool
+        - reasons: list[str] (reason codes)
+        - conflicts: list[dict] (top similar items for debugging/prompting)
+        """
+        cfg = (self.config.get("agent", {}) or {}).get("similarity_gate", {}) or {}
+        enabled = bool(cfg.get("enabled", True))
+        if not enabled:
+            return {"passed": True, "reasons": [], "conflicts": []}
+
+        n = int(expected_num_components or 0)
+        if n <= 0:
+            return {"passed": True, "reasons": [], "conflicts": []}
+
+        # How far we must move in component space.
+        default_min_changes = 2 if n >= 4 else 1
+        min_component_changes = int(
+            cfg.get("min_component_changes", default_min_changes)
+        )
+        min_component_changes = max(1, min(min_component_changes, max(1, n)))
+        max_overlap = max(0, n - min_component_changes)
+
+        # Only check a bounded window of history for latency.
+        history_limit = int(cfg.get("history_check_limit", 200))
+        history = self._collect_recent_recommendations_for_dedup_prompt(
+            task,
+            expected_num_components=n,
+            limit=history_limit,
+        )
+
+        cand_norm = normalize_formulation(candidate_formulation, n)
+        cand_comps = self._extract_components_norm(cand_norm, n)
+        cand_set = set(cand_comps)
+        cand_sig = self._scaled_formulation_signature(cand_norm, n)
+
+        if not cand_set:
+            return {"passed": True, "reasons": [], "conflicts": []}
+
+        reasons: List[str] = []
+        conflicts: List[Dict[str, Any]] = []
+
+        def _consider(
+            *,
+            source: str,
+            rec_id: str,
+            summary: str,
+            comps_norm: List[str],
+            ratio_raw: str,
+        ) -> None:
+            nonlocal reasons, conflicts
+            hs = set([x for x in (comps_norm or []) if x])
+            if not hs:
+                return
+
+            overlap = len(cand_set & hs)
+
+            # Primary: component overlap too high.
+            if overlap > max_overlap:
+                reasons.append("too_similar_history_components")
+                conflicts.append(
+                    {
+                        "source": source,
+                        "recommendation_id": rec_id,
+                        "overlap": overlap,
+                        "component_count": n,
+                        "summary": summary,
+                    }
+                )
+                return
+
+            # Secondary: exact (scale-invariant) signature match.
+            if cand_sig:
+                try:
+                    dummy = None
+                    if n == 2:
+                        dummy = {
+                            "HBD": (comps_norm[0] if len(comps_norm) > 0 else ""),
+                            "HBA": (comps_norm[1] if len(comps_norm) > 1 else ""),
+                            "molar_ratio": ratio_raw,
+                        }
+                    else:
+                        dummy = {
+                            "components": [{"name": x} for x in (comps_norm or [])],
+                            "molar_ratio": ratio_raw,
+                        }
+                    hsig = self._scaled_formulation_signature(dummy, n)
+                    if hsig and hsig == cand_sig:
+                        reasons.append("too_similar_history_signature")
+                        conflicts.append(
+                            {
+                                "source": source,
+                                "recommendation_id": rec_id,
+                                "overlap": overlap,
+                                "component_count": n,
+                                "summary": summary,
+                            }
+                        )
+                except Exception:
+                    return
+
+        # Compare against recent recommendation history (including PENDING).
+        for h in history:
+            if not isinstance(h, dict):
+                continue
+            rec_id = str(h.get("recommendation_id") or "").strip()
+            summary = str(h.get("formulation_summary") or "").strip()
+            ratio_raw = str(h.get("ratio_raw") or h.get("ratio_bucket") or "").strip()
+            comps_norm = h.get("components_norm")
+            if not isinstance(comps_norm, list):
+                continue
+            _consider(
+                source="history",
+                rec_id=rec_id,
+                summary=summary,
+                comps_norm=[str(x) for x in comps_norm if x is not None],
+                ratio_raw=ratio_raw,
+            )
+
+        # Compare against prior candidates in this task (prevents within-task loops).
+        for i, pc in enumerate(prior_candidates or [], 1):
+            if not isinstance(pc, dict):
+                continue
+            f = pc.get("formulation")
+            try:
+                f_norm = normalize_formulation(f, n)
+            except Exception:
+                f_norm = f
+            comps_norm = self._extract_components_norm(f_norm, n)
+            ratio_raw = (
+                str((f_norm or {}).get("molar_ratio") or "")
+                if isinstance(f_norm, dict)
+                else ""
+            )
+            _consider(
+                source="prior_candidate",
+                rec_id=f"candidate#{i}",
+                summary=summarize_formulation(f_norm),
+                comps_norm=comps_norm,
+                ratio_raw=ratio_raw,
+            )
+
+        # Keep only the most informative conflicts.
+        conflicts.sort(key=lambda x: int(x.get("overlap") or 0), reverse=True)
+        reasons_unique: List[str] = []
+        for r in reasons:
+            if r not in reasons_unique:
+                reasons_unique.append(r)
+
+        passed = len(reasons_unique) == 0
+        return {
+            "passed": passed,
+            "reasons": reasons_unique,
+            "conflicts": conflicts[:3],
+            "min_component_changes": min_component_changes,
+            "max_overlap": max_overlap,
+        }
+
     def _build_non_duplication_block_for_prompt(
         self,
         *,
@@ -3269,6 +3553,60 @@ Output ONLY the query text (no JSON, no explanation):"""
                 "[Acceptance] Failed to evaluate candidate acceptance: %s", str(e)
             )
 
+        # P2.3: Similarity gate (hard reject near-duplicates to history/prior candidates).
+        try:
+            sim = self._similarity_gate_check(
+                (cand or {}).get("formulation") if isinstance(cand, dict) else None,
+                task=task,
+                expected_num_components=expected_num_components,
+                prior_candidates=(prior_candidates or []),
+            )
+            cand["_similarity_gate"] = sim
+
+            if not bool(sim.get("passed")):
+                # Ensure _acceptance exists so downstream selection logic can treat this as rejected.
+                accd = cand.get("_acceptance")
+                if not isinstance(accd, dict):
+                    accd = {
+                        "accepted": True,
+                        "recommendation_class": "RECOMMENDATION",
+                        "baseline_reference": str(
+                            cand.get("baseline_reference") or "none"
+                        ),
+                        "delta_to_baseline": cand.get("delta_to_baseline")
+                        if isinstance(cand.get("delta_to_baseline"), list)
+                        else [],
+                        "reasons": [],
+                        "candidate_signature": compute_formulation_signature(
+                            cand.get("formulation"), expected_num_components
+                        ),
+                        "matched_baseline_id": None,
+                    }
+                    cand["_acceptance"] = accd
+
+                # Override acceptance.
+                reasons = (
+                    accd.get("reasons") if isinstance(accd.get("reasons"), list) else []
+                )
+                merged: List[str] = [str(r) for r in (reasons or []) if r is not None]
+                for r in sim.get("reasons") or []:
+                    r = str(r)
+                    if r and r not in merged:
+                        merged.append(r)
+                accd["reasons"] = merged
+                accd["accepted"] = False
+                accd["similarity_gate"] = {
+                    "passed": False,
+                    "reasons": sim.get("reasons") or [],
+                    "conflicts": sim.get("conflicts") or [],
+                    "min_component_changes": sim.get("min_component_changes"),
+                    "max_overlap": sim.get("max_overlap"),
+                }
+        except Exception as e:
+            logger.warning(
+                "[SimilarityGate] Failed to evaluate similarity gate: %s", str(e)
+            )
+
         return cand
 
     def _build_formulation_parameters_schema(
@@ -3904,6 +4242,21 @@ Format your response as JSON:
         if "schema_invalid" in reason_set:
             lines.append(
                 "- Output must strictly match the required JSON schema (fixed component count + required fields)."
+            )
+
+        if any(str(r).startswith("too_similar_history") for r in reason_set):
+            # Similarity gate is stricter than baseline repeat: it blocks near-duplicates.
+            min_changes = 2 if int(expected_num_components or 0) >= 4 else 1
+            lines.append(
+                "- Similarity gate rejected a near-duplicate. Your next candidate MUST be substantially different from recent recommendations "
+                "(do NOT keep the same component set and only tweak ratios/water)."
+            )
+            lines.append(
+                f"- Change at least {min_changes} component identities relative to recent history; also choose a meaningfully different molar_ratio bucket."
+            )
+            lines.append(
+                "- Seek a different dissolution/leaching mechanism class (e.g., Lewis-acidic metal-chloride DES / chlorometallate, stronger halide complexation, "
+                "different chelation chemistry), and make that explicit in the reasoning."
             )
 
         lines.append("")  # trailing newline
