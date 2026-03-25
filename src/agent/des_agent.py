@@ -1374,7 +1374,9 @@ Output JSON:
             return {"passed": True, "reasons": [], "conflicts": []}
 
         # How far we must move in component space.
-        default_min_changes = 2 if n >= 4 else 1
+        # Relaxed rule: changing at least one component is enough to pass the
+        # similarity gate, even for multi-component formulations.
+        default_min_changes = 1
         min_component_changes = int(
             cfg.get("min_component_changes", default_min_changes)
         )
@@ -1742,8 +1744,9 @@ Output JSON:
             "Treat proportional molar-ratio scaling as the same formulation (e.g., 1:2 is the same as 2:4).\n"
         )
         lines.append(
-            "Diversity rule (MUST): Avoid overly similar formulations. A tiny molar-ratio tweak is NOT sufficient; "
-            "diversify BOTH the component selection AND the molar ratio bucket.\n"
+            "Diversity rule (MUST): Avoid overly similar formulations. A candidate is sufficiently different for this gate if it changes "
+            "at least ONE component identity relative to recent history. A ratio-only tweak is NOT sufficient. Reusing a familiar molar-ratio bucket is allowed "
+            "when the component set has changed.\n"
         )
 
         if expected_num_components == 2:
@@ -1755,7 +1758,7 @@ Output JSON:
                 "- At least ONE of {HBD, HBA} must be outside the recently used component pool."
             )
             lines.append(
-                "- Choose a molar_ratio bucket NOT in the recently used ratio bucket pool."
+                "- Prefer a fresh molar_ratio bucket, but this is NOT required if at least one of {HBD, HBA} is new."
             )
             lines.append(
                 "- If strict compliance is impossible due to hard constraints (availability/toxicity/etc.), justify any reuse in the reasoning and maximize novelty in the other dimension."
@@ -1767,7 +1770,7 @@ Output JSON:
                 "- Include at least ONE component outside the recently used component pool."
             )
             lines.append(
-                "- Choose a molar_ratio pattern NOT in the recently used ratio bucket pool."
+                "- Prefer a fresh molar_ratio pattern, but this is NOT required if at least ONE component is new."
             )
             lines.append(
                 "- If strict compliance is impossible due to hard constraints (availability/toxicity/etc.), justify any reuse in the reasoning and maximize novelty in the other dimension."
@@ -4246,17 +4249,35 @@ Format your response as JSON:
 
         if any(str(r).startswith("too_similar_history") for r in reason_set):
             # Similarity gate is stricter than baseline repeat: it blocks near-duplicates.
-            min_changes = 2 if int(expected_num_components or 0) >= 4 else 1
+            sim_cfg = (self.config.get("agent", {}) or {}).get(
+                "similarity_gate", {}
+            ) or {}
+            min_changes = int(sim_cfg.get("min_component_changes", 1))
+            min_changes = max(
+                1, min(min_changes, max(1, int(expected_num_components or 0)))
+            )
             lines.append(
                 "- Similarity gate rejected a near-duplicate. Your next candidate MUST be substantially different from recent recommendations "
                 "(do NOT keep the same component set and only tweak ratios/water)."
             )
             lines.append(
-                f"- Change at least {min_changes} component identities relative to recent history; also choose a meaningfully different molar_ratio bucket."
+                f"- Change at least {min_changes} component identity relative to recent history. Reusing a familiar molar_ratio bucket is acceptable if the component set is no longer the same."
             )
             lines.append(
                 "- Seek a different dissolution/leaching mechanism class (e.g., Lewis-acidic metal-chloride DES / chlorometallate, stronger halide complexation, "
                 "different chelation chemistry), and make that explicit in the reasoning."
+            )
+            lines.append(
+                "- IMPORTANT: When direct precedent is insufficient, you are allowed to make a bold but chemically grounded exploratory hypothesis using your parametric knowledge."
+            )
+            lines.append(
+                "- The goal of this round is not only local performance optimization, but also informative exploration. A candidate that may underperform now can still be valuable if it opens a new mechanistic path and produces new experimental lessons."
+            )
+            lines.append(
+                "- Therefore, do NOT retreat to another conservative near-variant of a previously rejected family. Instead, propose a testable candidate that creates a new search branch with clear mechanistic intent."
+            )
+            lines.append(
+                "- Your reasoning MUST explain: (1) the hypothesized mechanism, (2) why this candidate is not just a local tweak of the rejected family, and (3) what new information the experiment would teach us even if the result is negative."
             )
 
         lines.append("")  # trailing newline
