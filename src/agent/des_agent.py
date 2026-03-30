@@ -10,7 +10,9 @@ import logging
 from datetime import datetime
 import asyncio
 import json
+import math
 import re
+from fractions import Fraction
 
 from .reasoningbank import (
     ReasoningBank,
@@ -25,13 +27,13 @@ from .reasoningbank import (
     RecommendationManager,
     FeedbackProcessor,
     Recommendation,
-    ExperimentResult
+    ExperimentResult,
 )
 
 from .prompts import (
     OBSERVE_PROMPT,
     format_action_result_for_observe,
-    parse_observe_output
+    parse_observe_output,
 )
 from .utils.serialization import to_jsonable
 from .utils.json_extract import loads_json_from_text
@@ -43,6 +45,7 @@ from .utils.formulation_validation import (
 from .utils.formulation_signature import (
     BaselineRecord,
     compute_formulation_signature,
+    normalize_component_name,
     normalize_material_name,
     normalize_temperature_C,
 )
@@ -88,7 +91,7 @@ class DESAgent:
         rec_manager: RecommendationManager,  # NEW: Required
         corerag_client: Optional[object] = None,
         largerag_client: Optional[object] = None,
-        config: Optional[Dict] = None
+        config: Optional[Dict] = None,
     ):
         """
         Initialize DESAgent with async feedback support.
@@ -153,29 +156,47 @@ class DESAgent:
             stage = "Late"
 
         # Summarize accumulated knowledge
-        theory_summary = f"{knowledge_state['num_theory_queries']} queries made" if knowledge_state['num_theory_queries'] > 0 else "Not retrieved"
-        literature_summary = f"{knowledge_state['num_literature_queries']} queries made" if knowledge_state['num_literature_queries'] > 0 else "Not retrieved"
+        theory_summary = (
+            f"{knowledge_state['num_theory_queries']} queries made"
+            if knowledge_state["num_theory_queries"] > 0
+            else "Not retrieved"
+        )
+        literature_summary = (
+            f"{knowledge_state['num_literature_queries']} queries made"
+            if knowledge_state["num_literature_queries"] > 0
+            else "Not retrieved"
+        )
 
         # NEW: Failure tracking summary
-        failed_theory = knowledge_state.get('failed_theory_attempts', 0)
-        failed_literature = knowledge_state.get('failed_literature_attempts', 0)
+        failed_theory = knowledge_state.get("failed_theory_attempts", 0)
+        failed_literature = knowledge_state.get("failed_literature_attempts", 0)
 
         # Format memory summary
         memory_summary = ""
-        if knowledge_state['memories'] and len(knowledge_state['memories']) > 0:
+        if knowledge_state["memories"] and len(knowledge_state["memories"]) > 0:
             memory_summary = "\n**Retrieved Memories Summary**:\n"
-            for i, mem in enumerate(knowledge_state['memories'][:3], 1):
+            for i, mem in enumerate(knowledge_state["memories"][:3], 1):
                 measurements = mem.metadata.get("measurements", [])
                 max_eff = None
                 unit = ""
                 for m in measurements:
                     if m.get("leaching_efficiency") is not None:
-                        max_eff = m.get("leaching_efficiency") if max_eff is None else max(max_eff, m.get("leaching_efficiency"))
+                        max_eff = (
+                            m.get("leaching_efficiency")
+                            if max_eff is None
+                            else max(max_eff, m.get("leaching_efficiency"))
+                        )
                         unit = m.get("unit", unit)
-                eff_text = f"浸出效率≈{max_eff} {unit}" if max_eff is not None else "无浸出数据"
+                eff_text = (
+                    f"浸出效率≈{max_eff} {unit}"
+                    if max_eff is not None
+                    else "无浸出数据"
+                )
                 memory_summary += f"  {i}. {mem.title[:80]}... ({eff_text})\n"
-            if len(knowledge_state['memories']) > 3:
-                memory_summary += f"  ... and {len(knowledge_state['memories']) - 3} more\n"
+            if len(knowledge_state["memories"]) > 3:
+                memory_summary += (
+                    f"  ... and {len(knowledge_state['memories']) - 3} more\n"
+                )
 
         # ===== P2: Budgets + stagnation signals (used for prompts and policy guards) =====
         agent_cfg = self.config.get("agent", {}) or {}
@@ -199,10 +220,10 @@ class DESAgent:
 
         think_prompt = f"""You are a DES (Deep Eutectic Solvent) formulation expert planning your research approach.
 
-**Task**: {task['description']}
-**Target Material**: {task['target_material']}
-**Target Temperature**: {task.get('target_temperature', 25)}°C
-**Constraints**: {task.get('constraints', {})}
+**Task**: {task["description"]}
+**Target Material**: {task["target_material"]}
+**Target Temperature**: {task.get("target_temperature", 25)}°C
+**Constraints**: {task.get("constraints", {})}
 
 **Primary Objective (performance-first)**:
 - Aim to propose the **best-performing** DES recommendation for the target conditions (maximize dissolution/leaching efficiency at the target temperature).
@@ -213,13 +234,13 @@ class DESAgent:
 {final_round_note}
 
 **Current Knowledge State**:
-- Memories retrieved: {knowledge_state['memories_retrieved']} ({len(knowledge_state['memories'] or [])} items)
+- Memories retrieved: {knowledge_state["memories_retrieved"]} ({len(knowledge_state["memories"] or [])} items)
 {memory_summary}
 - Theoretical knowledge (CoreRAG): {theory_summary} (failed attempts: {failed_theory})
 - Literature knowledge (LargeRAG): {literature_summary} (failed attempts: {failed_literature})
-- Formulation candidates generated: {len(knowledge_state['formulation_candidates'])} (valid: {num_valid_candidates})
-- Previous observations: {len(knowledge_state['observations'])}
-- query_parallel executed: {int(knowledge_state.get('num_parallel_queries', 0))} (budget: {max_parallel})
+- Formulation candidates generated: {len(knowledge_state["formulation_candidates"])} (valid: {num_valid_candidates})
+- Previous observations: {len(knowledge_state["observations"])}
+- query_parallel executed: {int(knowledge_state.get("num_parallel_queries", 0))} (budget: {max_parallel})
 - Stagnation detected: {stagnating}
 
 **Tool Budgets (hard caps)**:
@@ -228,10 +249,10 @@ class DESAgent:
 - query_parallel actions: max {max_parallel}
 
 **Recent Observations**:
-{self._format_observations(knowledge_state['observations'][-2:] if len(knowledge_state['observations']) > 0 else [])}
+{self._format_observations(knowledge_state["observations"][-2:] if len(knowledge_state["observations"]) > 0 else [])}
 
 **Latest OBSERVE Analysis** (from previous iteration):
-{self._format_latest_observe_recommendation(knowledge_state['observations'])}
+{self._format_latest_observe_recommendation(knowledge_state["observations"])}
 
 **Available Actions**:
 1. **retrieve_memories** - Get past experiences from ReasoningBank (validated experimental data). NOTE: If returned empty in last iteration, you may skip and proceed with other tools.
@@ -277,11 +298,11 @@ class DESAgent:
 - If you already have both theory and literature, prefer generate_formulation/refine_formulation instead of query_parallel.
 
 **Decision Guidelines by Stage**:
-- **Early ({stage == 'Early' and '✓' or '✗'})**:
+- **Early ({stage == "Early" and "✓" or "✗"})**:
   - **Priority 1**: Retrieve memories if not yet done. If returns 0, immediately proceed to Priority 2.
   - **Priority 2**: Query literature/theory (memories empty OR insufficient)
-- **Mid ({stage == 'Mid' and '✓' or '✗'})**: Ensure sufficient knowledge from available sources (memories when available + tools)
-- **Late ({stage == 'Late' and '✓' or '✗'})**: Must generate formulation soon. If you have any knowledge sources (memories/theory/literature) → generate now
+- **Mid ({stage == "Mid" and "✓" or "✗"})**: Ensure sufficient knowledge from available sources (memories when available + tools)
+- **Late ({stage == "Late" and "✓" or "✗"})**: Must generate formulation soon. If you have any knowledge sources (memories/theory/literature) → generate now
 
 **STRICT Anti-Loop Rules**:
 - **STOP after 2 consecutive failures**: If a tool fails 2 times in a row → STOP trying, move to alternative action
@@ -309,16 +330,25 @@ Output JSON:
 
             # Validate action
             valid_actions = [
-                "retrieve_memories", "query_theory", "query_literature",
-                "query_parallel", "generate_formulation", "refine_formulation", "finish"
+                "retrieve_memories",
+                "query_theory",
+                "query_literature",
+                "query_parallel",
+                "generate_formulation",
+                "refine_formulation",
+                "finish",
             ]
 
             if thought.get("action") not in valid_actions:
-                logger.warning(f"Invalid action '{thought.get('action')}', defaulting to retrieve_memories")
+                logger.warning(
+                    f"Invalid action '{thought.get('action')}', defaulting to retrieve_memories"
+                )
                 thought["action"] = "retrieve_memories"
 
             # Apply deterministic policy guards (budgets, anti-parallel default, stagnation).
-            return self._apply_think_policy(thought, task, knowledge_state, iteration, max_iterations)
+            return self._apply_think_policy(
+                thought, task, knowledge_state, iteration, max_iterations
+            )
 
         except Exception as e:
             logger.error(f"Think phase failed: {e}")
@@ -326,22 +356,28 @@ Output JSON:
             if not knowledge_state["memories_retrieved"]:
                 return self._apply_think_policy(
                     {
-                    "action": "retrieve_memories",
-                    "reasoning": "Starting with memory retrieval (fallback decision)",
-                    "information_gaps": ["All information"]
+                        "action": "retrieve_memories",
+                        "reasoning": "Starting with memory retrieval (fallback decision)",
+                        "information_gaps": ["All information"],
                     },
                     task,
                     knowledge_state,
                     iteration,
                     max_iterations,
                 )
-            elif not knowledge_state["theory_knowledge"] and not knowledge_state["literature_knowledge"]:
+            elif (
+                not knowledge_state["theory_knowledge"]
+                and not knowledge_state["literature_knowledge"]
+            ):
                 # Prefer literature first (fast, empirical). Only use CoreRAG if necessary/available.
                 if self.largerag:
                     base = {
                         "action": "query_literature",
                         "reasoning": "Need empirical recipes/conditions to ground the search (fallback decision)",
-                        "information_gaps": ["Empirical recipes", "Room-temperature performance data"],
+                        "information_gaps": [
+                            "Empirical recipes",
+                            "Room-temperature performance data",
+                        ],
                     }
                 elif self.corerag:
                     base = {
@@ -356,13 +392,15 @@ Output JSON:
                         "information_gaps": [],
                     }
 
-                return self._apply_think_policy(base, task, knowledge_state, iteration, max_iterations)
+                return self._apply_think_policy(
+                    base, task, knowledge_state, iteration, max_iterations
+                )
             else:
                 return self._apply_think_policy(
                     {
-                    "action": "generate_formulation",
-                    "reasoning": "Have sufficient information (fallback decision)",
-                    "information_gaps": []
+                        "action": "generate_formulation",
+                        "reasoning": "Have sufficient information (fallback decision)",
+                        "information_gaps": [],
                     },
                     task,
                     knowledge_state,
@@ -370,7 +408,9 @@ Output JSON:
                     max_iterations,
                 )
 
-    def _act(self, action: str, task: Dict, knowledge_state: Dict, tool_calls: List) -> Dict:
+    def _act(
+        self, action: str, task: Dict, knowledge_state: Dict, tool_calls: List
+    ) -> Dict:
         """
         ACT phase: Execute the chosen action.
 
@@ -397,83 +437,131 @@ Output JSON:
                 "action": "retrieve_memories",
                 "success": True,
                 "data": memories,
-                "summary": f"Retrieved {len(memories)} relevant memories from past experiences"
+                "summary": f"Retrieved {len(memories)} relevant memories from past experiences",
             }
 
         elif action == "query_theory":
             theory = self._query_corerag(task, knowledge_state)
-            if theory:
+            ok = self._is_valid_corerag_result(theory)
+
+            # Always record tool call for traceability.
+            tool_calls.append(
+                {
+                    "tool": "CoreRAG",
+                    "query": (
+                        (theory or {}).get("_query_text")
+                        if isinstance(theory, dict)
+                        else task["description"]
+                    )
+                    or task["description"],
+                    "success": ok,
+                    "result": theory,
+                }
+            )
+
+            if ok:
                 knowledge_state["theory_knowledge"].append(theory)  # Accumulate
                 knowledge_state["num_theory_queries"] += 1
-                tool_calls.append({
-                    "tool": "CoreRAG",
-                    # Record the *actual* query sent to CoreRAG (LLM-generated), not the task description.
-                    "query": (theory.get("_query_text") if isinstance(theory, dict) else task["description"]),
-                    "result": theory
-                })
+                knowledge_state["failed_theory_attempts"] = 0
             else:
                 knowledge_state["failed_theory_attempts"] += 1  # Track failure
             return {
                 "action": "query_theory",
-                "success": theory is not None,
+                "success": ok,
                 "data": theory,
-                "summary": f"Retrieved theoretical knowledge from CoreRAG ontology (query #{knowledge_state['num_theory_queries']})" if theory else "CoreRAG query failed"
+                "summary": f"Retrieved theoretical knowledge from CoreRAG ontology (query #{knowledge_state['num_theory_queries']})"
+                if ok
+                else "CoreRAG query failed",
             }
 
         elif action == "query_literature":
             literature = self._query_largerag(task, knowledge_state)
-            if literature:
+            ok = self._is_valid_largerag_result(literature)
+
+            # Always record tool call for traceability.
+            tool_calls.append(
+                {
+                    "tool": "LargeRAG",
+                    "query": (
+                        (literature or {}).get("_query_text")
+                        if isinstance(literature, dict)
+                        else task["description"]
+                    )
+                    or task["description"],
+                    "success": ok,
+                    "result": literature,
+                }
+            )
+
+            if ok:
                 knowledge_state["literature_knowledge"].append(literature)  # Accumulate
                 knowledge_state["num_literature_queries"] += 1
-                tool_calls.append({
-                    "tool": "LargeRAG",
-                    # Record the *actual* query sent to LargeRAG (LLM-generated), not the task description.
-                    "query": (literature.get("_query_text") if isinstance(literature, dict) else task["description"]),
-                    "result": literature
-                })
+                knowledge_state["failed_literature_attempts"] = 0
             else:
                 knowledge_state["failed_literature_attempts"] += 1  # Track failure
             return {
                 "action": "query_literature",
-                "success": literature is not None,
+                "success": ok,
                 "data": literature,
-                "summary": f"Retrieved literature precedents from LargeRAG (query #{knowledge_state['num_literature_queries']})" if literature else "LargeRAG query failed"
+                "summary": f"Retrieved literature precedents from LargeRAG (query #{knowledge_state['num_literature_queries']})"
+                if ok
+                else "LargeRAG query failed",
             }
 
         elif action == "query_parallel":
             # Parallel query both tools
-            knowledge_state["num_parallel_queries"] = knowledge_state.get("num_parallel_queries", 0) + 1
+            knowledge_state["num_parallel_queries"] = (
+                knowledge_state.get("num_parallel_queries", 0) + 1
+            )
             theory, literature = self._query_tools_parallel(task, knowledge_state)
 
-            if theory:
-                knowledge_state["theory_knowledge"].append(theory)  # Accumulate
-                knowledge_state["num_theory_queries"] += 1
-                tool_calls.append({
-                    "tool": "CoreRAG",
-                    "query": (theory.get("_query_text") if isinstance(theory, dict) else task["description"]),
-                    "result": theory
-                })
-            else:
-                knowledge_state["failed_theory_attempts"] += 1
+            ok_theory = self._is_valid_corerag_result(theory)
+            ok_lit = self._is_valid_largerag_result(literature)
 
-            if literature:
-                knowledge_state["literature_knowledge"].append(literature)  # Accumulate
-                knowledge_state["num_literature_queries"] += 1
-                tool_calls.append({
-                    "tool": "LargeRAG",
-                    "query": (literature.get("_query_text") if isinstance(literature, dict) else task["description"]),
-                    "result": literature
-                })
-            else:
-                knowledge_state["failed_literature_attempts"] += 1
+            # Record tool calls when the tool returned a trace object.
+            if isinstance(theory, dict):
+                tool_calls.append(
+                    {
+                        "tool": "CoreRAG",
+                        "query": theory.get("_query_text") or task["description"],
+                        "success": ok_theory,
+                        "result": theory,
+                    }
+                )
+            if isinstance(literature, dict):
+                tool_calls.append(
+                    {
+                        "tool": "LargeRAG",
+                        "query": literature.get("_query_text") or task["description"],
+                        "success": ok_lit,
+                        "result": literature,
+                    }
+                )
+
+            if theory is not None:
+                if ok_theory:
+                    knowledge_state["theory_knowledge"].append(theory)  # Accumulate
+                    knowledge_state["num_theory_queries"] += 1
+                    knowledge_state["failed_theory_attempts"] = 0
+                else:
+                    knowledge_state["failed_theory_attempts"] += 1
+
+            if literature is not None:
+                if ok_lit:
+                    knowledge_state["literature_knowledge"].append(
+                        literature
+                    )  # Accumulate
+                    knowledge_state["num_literature_queries"] += 1
+                    knowledge_state["failed_literature_attempts"] = 0
+                else:
+                    knowledge_state["failed_literature_attempts"] += 1
 
             return {
                 "action": "query_parallel",
-                "success": (theory is not None) or (literature is not None),
+                "success": ok_theory or ok_lit,
                 "data": {"theory": theory, "literature": literature},
-                "summary": f"Parallel query: CoreRAG {'✓ (query #' + str(knowledge_state['num_theory_queries']) + ')' if theory else '✗'}, LargeRAG {'✓ (query #' + str(knowledge_state['num_literature_queries']) + ')' if literature else '✗'}"
+                "summary": f"Parallel query: CoreRAG {'✓ (query #' + str(knowledge_state['num_theory_queries']) + ')' if ok_theory else '✗'}, LargeRAG {'✓ (query #' + str(knowledge_state['num_literature_queries']) + ')' if ok_lit else '✗'}",
             }
-
         elif action == "generate_formulation":
             # Ensure memories are retrieved
             if not knowledge_state["memories_retrieved"]:
@@ -490,15 +578,29 @@ Output JSON:
             )
 
             knowledge_state["formulation_candidates"].append(formulation)
-            diag = formulation.get("_diagnostics") if isinstance(formulation, dict) else None
+            diag = (
+                formulation.get("_diagnostics")
+                if isinstance(formulation, dict)
+                else None
+            )
             valid = bool(diag.get("validation_ok")) if isinstance(diag, dict) else False
-            acc = formulation.get("_acceptance") if isinstance(formulation, dict) else None
+            acc = (
+                formulation.get("_acceptance")
+                if isinstance(formulation, dict)
+                else None
+            )
             accepted = bool(acc.get("accepted")) if isinstance(acc, dict) else False
-            rec_class = str(acc.get("recommendation_class")) if isinstance(acc, dict) else "N/A"
+            rec_class = (
+                str(acc.get("recommendation_class")) if isinstance(acc, dict) else "N/A"
+            )
             reasons = acc.get("reasons") if isinstance(acc, dict) else []
-            reasons_short = ", ".join([str(r) for r in (reasons or [])[:2]]) if reasons else ""
+            reasons_short = (
+                ", ".join([str(r) for r in (reasons or [])[:2]]) if reasons else ""
+            )
             formulation_summary = summarize_formulation(
-                (formulation or {}).get("formulation") if isinstance(formulation, dict) else None
+                (formulation or {}).get("formulation")
+                if isinstance(formulation, dict)
+                else None
             )
             return {
                 "action": "generate_formulation",
@@ -508,7 +610,11 @@ Output JSON:
                     f"Generated formulation: {formulation_summary} "
                     f"(confidence: {(formulation or {}).get('confidence', 0):.2f}, valid={valid}, "
                     f"accepted={accepted}, class={rec_class}"
-                    + (f", reasons={reasons_short}" if (not accepted and reasons_short) else "")
+                    + (
+                        f", reasons={reasons_short}"
+                        if (not accepted and reasons_short)
+                        else ""
+                    )
                     + ")"
                 ),
             }
@@ -517,7 +623,9 @@ Output JSON:
             # Generate additional candidate with current knowledge
             if not knowledge_state["formulation_candidates"]:
                 # No formulation to refine, generate new one
-                return self._act("generate_formulation", task, knowledge_state, tool_calls)
+                return self._act(
+                    "generate_formulation", task, knowledge_state, tool_calls
+                )
 
             formulation = self._generate_formulation(
                 task,
@@ -529,15 +637,29 @@ Output JSON:
             )
 
             knowledge_state["formulation_candidates"].append(formulation)
-            diag = formulation.get("_diagnostics") if isinstance(formulation, dict) else None
+            diag = (
+                formulation.get("_diagnostics")
+                if isinstance(formulation, dict)
+                else None
+            )
             valid = bool(diag.get("validation_ok")) if isinstance(diag, dict) else False
-            acc = formulation.get("_acceptance") if isinstance(formulation, dict) else None
+            acc = (
+                formulation.get("_acceptance")
+                if isinstance(formulation, dict)
+                else None
+            )
             accepted = bool(acc.get("accepted")) if isinstance(acc, dict) else False
-            rec_class = str(acc.get("recommendation_class")) if isinstance(acc, dict) else "N/A"
+            rec_class = (
+                str(acc.get("recommendation_class")) if isinstance(acc, dict) else "N/A"
+            )
             reasons = acc.get("reasons") if isinstance(acc, dict) else []
-            reasons_short = ", ".join([str(r) for r in (reasons or [])[:2]]) if reasons else ""
+            reasons_short = (
+                ", ".join([str(r) for r in (reasons or [])[:2]]) if reasons else ""
+            )
             formulation_summary = summarize_formulation(
-                (formulation or {}).get("formulation") if isinstance(formulation, dict) else None
+                (formulation or {}).get("formulation")
+                if isinstance(formulation, dict)
+                else None
             )
             return {
                 "action": "refine_formulation",
@@ -547,7 +669,11 @@ Output JSON:
                     f"Refined formulation: {formulation_summary} "
                     f"(now have {len(knowledge_state['formulation_candidates'])} candidates, valid={valid}, "
                     f"accepted={accepted}, class={rec_class}"
-                    + (f", reasons={reasons_short}" if (not accepted and reasons_short) else "")
+                    + (
+                        f", reasons={reasons_short}"
+                        if (not accepted and reasons_short)
+                        else ""
+                    )
                     + ")"
                 ),
             }
@@ -558,10 +684,59 @@ Output JSON:
                 "action": action,
                 "success": False,
                 "data": None,
-                "summary": f"Unknown action: {action}"
+                "summary": f"Unknown action: {action}",
             }
 
-    def _observe(self, action_result: Dict, knowledge_state: Dict, task: Dict, iteration: int) -> Dict:
+    @staticmethod
+    def _is_valid_largerag_result(result: Any) -> bool:
+        """Return True when LargeRAG returned usable documents."""
+        if not isinstance(result, dict):
+            return False
+        q = result.get("_query_text")
+        if isinstance(q, str) and not q.strip():
+            return False
+        docs = result.get("documents")
+        if isinstance(docs, list) and len(docs) > 0:
+            return True
+        num = result.get("num_results")
+        if isinstance(num, int) and num > 0:
+            return True
+        return False
+
+    @staticmethod
+    def _is_valid_corerag_result(result: Any) -> bool:
+        """Return True when CoreRAG returned usable theory content."""
+        if not isinstance(result, dict):
+            return False
+
+        for k in ("summary", "answer", "formatted_text"):
+            v = result.get(k)
+            if isinstance(v, str) and v.strip():
+                return True
+
+        for k in ("key_points", "background_information", "relationships"):
+            v = result.get(k)
+            if isinstance(v, list) and any(str(x).strip() for x in v):
+                return True
+
+        # CoreRAG can return a tool-call style list under `results`.
+        results = result.get("results")
+        if isinstance(results, list) and results:
+            for r in results:
+                if not isinstance(r, dict):
+                    continue
+                if r.get("error"):
+                    continue
+                # Any non-empty non-error result is considered usable.
+                if r.get("result"):
+                    return True
+            return False
+
+        return False
+
+    def _observe(
+        self, action_result: Dict, knowledge_state: Dict, task: Dict, iteration: int
+    ) -> Dict:
         """
         OBSERVE phase: LLM-based analysis of action results.
 
@@ -599,14 +774,14 @@ Output JSON:
 
         # Format action result details
         action_result_summary = format_action_result_for_observe(
-            action_result["action"],
-            action_result,
-            knowledge_state
+            action_result["action"], action_result, knowledge_state
         )
 
         # Format recent observations
         recent_observations = self._format_observations(
-            knowledge_state["observations"][-2:] if len(knowledge_state["observations"]) > 0 else []
+            knowledge_state["observations"][-2:]
+            if len(knowledge_state["observations"]) > 0
+            else []
         )
 
         # Build OBSERVE prompt
@@ -629,7 +804,7 @@ Output JSON:
             failed_literature=knowledge_state["failed_literature_attempts"],
             num_formulations=len(knowledge_state["formulation_candidates"]),
             num_observations=len(knowledge_state["observations"]),
-            recent_observations=recent_observations
+            recent_observations=recent_observations,
         )
 
         # Call LLM for observation analysis
@@ -643,7 +818,9 @@ Output JSON:
                     )
 
             if response_format is not None:
-                llm_output = self.llm_client(observe_prompt, response_format=response_format)
+                llm_output = self.llm_client(
+                    observe_prompt, response_format=response_format
+                )
             else:
                 llm_output = self.llm_client(observe_prompt)
             observation = parse_observe_output(llm_output)
@@ -658,7 +835,9 @@ Output JSON:
             if not isinstance(observation.get("stagnation_detected"), bool):
                 observation["stagnation_detected"] = False
 
-            logger.info(f"[OBSERVE] LLM analysis: {observation.get('summary', 'No summary')[:100]}...")
+            logger.info(
+                f"[OBSERVE] LLM analysis: {observation.get('summary', 'No summary')[:100]}..."
+            )
 
         except Exception as e:
             logger.error(f"OBSERVE LLM call failed: {e}, using fallback")
@@ -673,7 +852,7 @@ Output JSON:
                 "information_sufficient": False,
                 "stagnation_detected": False,
                 "recommended_next_action": "generate_formulation",
-                "recommendation_reasoning": "Fallback due to LLM error"
+                "recommendation_reasoning": "Fallback due to LLM error",
             }
 
         return observation
@@ -722,7 +901,9 @@ Output JSON:
 
         # Extract recommendation if available
         recommended_action = latest.get("recommended_next_action", "N/A")
-        recommendation_reasoning = latest.get("recommendation_reasoning", "No reasoning provided")
+        recommendation_reasoning = latest.get(
+            "recommendation_reasoning", "No reasoning provided"
+        )
 
         formatted = f"- **Recommended Action**: {recommended_action}\n"
         formatted += f"- **Reasoning**: {recommendation_reasoning}\n"
@@ -771,7 +952,11 @@ Output JSON:
                 continue
 
             meta_material_norm = normalize_material_name(meta.get("target_material"))
-            if task_material_norm and meta_material_norm and meta_material_norm != task_material_norm:
+            if (
+                task_material_norm
+                and meta_material_norm
+                and meta_material_norm != task_material_norm
+            ):
                 continue
 
             meta_temp = normalize_temperature_C(meta.get("target_temperature"))
@@ -788,7 +973,7 @@ Output JSON:
 
             max_val: Optional[float] = None
             max_unit = "%"
-            for m in (rec.experiment_result.measurements or []):
+            for m in rec.experiment_result.measurements or []:
                 if m.get("leaching_efficiency") is None:
                     continue
                 try:
@@ -800,14 +985,20 @@ Output JSON:
                     max_unit = str(m.get("unit") or "%").strip() or "%"
 
             formulation_summary = summarize_formulation(rec.formulation)
-            sig = compute_formulation_signature(rec.formulation, expected_num_components)
+            sig = compute_formulation_signature(
+                rec.formulation, expected_num_components
+            )
 
             baselines.append(
                 BaselineRecord(
                     baseline_id=rec_id,
                     signature=sig,
-                    target_material_norm=normalize_material_name(rec.task.get("target_material")),
-                    target_temperature_C=normalize_temperature_C(rec.task.get("target_temperature")),
+                    target_material_norm=normalize_material_name(
+                        rec.task.get("target_material")
+                    ),
+                    target_temperature_C=normalize_temperature_C(
+                        rec.task.get("target_temperature")
+                    ),
                     max_efficiency_value=max_val,
                     max_efficiency_unit=max_unit,
                     formulation_summary=formulation_summary,
@@ -823,6 +1014,816 @@ Output JSON:
 
         baselines.sort(key=_score, reverse=True)
         return baselines
+
+    def _collect_recent_recommendations_for_dedup_prompt(
+        self,
+        task: Dict[str, Any],
+        *,
+        expected_num_components: int,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Collect recent recommendations under similar target conditions.
+
+        This is used to inject "do not repeat" context into the formulation prompt.
+        It intentionally includes PENDING recommendations (no experimental feedback yet).
+        """
+        if not getattr(self, "rec_manager", None):
+            return []
+
+        # Reuse acceptance tolerance to define "similar temperature".
+        acc_cfg = (self.config.get("agent", {}) or {}).get("acceptance", {}) or {}
+        tol_C = float(acc_cfg.get("temperature_tolerance_C", 0.5))
+
+        task_material_norm = normalize_material_name(task.get("target_material"))
+        task_temp = normalize_temperature_C(task.get("target_temperature"))
+
+        # Snapshot index under lock (do not hold the lock during formatting).
+        try:
+            lock = getattr(self.rec_manager, "_lock", None)
+            if lock is None:
+                index_items = list(getattr(self.rec_manager, "index", {}).items())
+            else:
+                with lock:
+                    index_items = list(getattr(self.rec_manager, "index", {}).items())
+        except Exception:
+            return []
+
+        items: List[Dict[str, Any]] = []
+        for rec_id, meta in index_items:
+            if not isinstance(meta, dict):
+                continue
+
+            # Filter by target material
+            meta_material_norm = normalize_material_name(meta.get("target_material"))
+            if (
+                task_material_norm
+                and meta_material_norm
+                and meta_material_norm != task_material_norm
+            ):
+                continue
+
+            # Filter by temperature when task specifies one
+            meta_temp = normalize_temperature_C(meta.get("target_temperature"))
+            if task_temp is not None:
+                if meta_temp is None:
+                    continue
+                if abs(float(task_temp) - float(meta_temp)) > tol_C:
+                    continue
+
+            formulation = meta.get("formulation")
+            if not isinstance(formulation, dict) or not formulation:
+                continue
+
+            # Only include formulations that match the expected schema (binary vs N-component).
+            try:
+                f_norm = normalize_formulation(formulation, expected_num_components)
+            except Exception:
+                f_norm = formulation
+
+            if expected_num_components == 2:
+                if (
+                    not isinstance(f_norm, dict)
+                    or not f_norm.get("HBD")
+                    or not f_norm.get("HBA")
+                ):
+                    continue
+            else:
+                comps = f_norm.get("components") if isinstance(f_norm, dict) else None
+                if not isinstance(comps, list) or len(comps) != expected_num_components:
+                    continue
+
+            summary = meta.get("formulation_summary")
+            if not isinstance(summary, str) or not summary.strip():
+                summary = summarize_formulation(f_norm)
+            summary = summary.strip()
+            if summary == "<invalid formulation>":
+                continue
+
+            # Extract compact component / ratio info for diversity constraints.
+            ratio_raw = (
+                str(f_norm.get("molar_ratio") or "").strip()
+                if isinstance(f_norm, dict)
+                else ""
+            )
+            ratio_bucket = self._normalize_ratio_bucket(
+                ratio_raw, expected_num_components
+            )
+
+            components_display: List[str] = []
+            components_norm: List[str] = []
+            hbd_display = ""
+            hba_display = ""
+            hbd_norm = ""
+            hba_norm = ""
+            pair_key = ""
+            pair_display = ""
+
+            if expected_num_components == 2 and isinstance(f_norm, dict):
+                hbd_display = str(f_norm.get("HBD") or "").strip()
+                hba_display = str(f_norm.get("HBA") or "").strip()
+                hbd_norm = normalize_component_name(hbd_display)
+                hba_norm = normalize_component_name(hba_display)
+                components_display = [hbd_display, hba_display]
+                components_norm = [hbd_norm, hba_norm]
+                if hbd_norm and hba_norm:
+                    pair_key = "|".join(sorted([hbd_norm, hba_norm]))
+                    pair_display = f"{hbd_display} + {hba_display}".strip()
+            elif isinstance(f_norm, dict):
+                comps = f_norm.get("components")
+                if isinstance(comps, list):
+                    for c in comps:
+                        if isinstance(c, dict):
+                            name = str(c.get("name") or "").strip()
+                        else:
+                            name = str(c or "").strip()
+                        if not name:
+                            continue
+                        components_display.append(name)
+                        components_norm.append(normalize_component_name(name))
+
+            # Filter empty norms (keeps pools clean).
+            components_norm = [
+                n for n in components_norm if isinstance(n, str) and n.strip()
+            ]
+
+            items.append(
+                {
+                    "recommendation_id": str(rec_id),
+                    "status": str(meta.get("status") or "UNKNOWN"),
+                    "created_at": str(meta.get("created_at") or ""),
+                    "target_temperature": meta.get("target_temperature"),
+                    "formulation_summary": summary,
+                    "components_display": components_display,
+                    "components_norm": components_norm,
+                    "ratio_raw": ratio_raw,
+                    "ratio_bucket": ratio_bucket or ratio_raw,
+                    "hbd_display": hbd_display,
+                    "hba_display": hba_display,
+                    "hbd_norm": hbd_norm,
+                    "hba_norm": hba_norm,
+                    "pair_key": pair_key,
+                    "pair_display": pair_display,
+                }
+            )
+
+        # Most recent first (ISO timestamps sort lexicographically).
+        items.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+
+        # De-duplicate identical summaries (keeps prompt compact).
+        uniq: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for it in items:
+            s = str(it.get("formulation_summary") or "")
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            uniq.append(it)
+            if len(uniq) >= max(0, int(limit)):
+                break
+
+        return uniq
+
+    @staticmethod
+    def _normalize_ratio_bucket(molar_ratio: Any, expected_num_components: int) -> str:
+        """Normalize a molar_ratio string into a scale-invariant bucket.
+
+        Examples:
+        - "2:4" -> "1:2"
+        - "0.5:1" -> "1:2"
+
+        If parsing fails, returns a cleaned (trimmed) ratio prefix.
+        """
+        s = str(molar_ratio or "").strip()
+        if not s:
+            return ""
+
+        parts = [p.strip() for p in s.split(":") if p.strip()]
+        if not parts:
+            return ""
+
+        n = int(expected_num_components or 0)
+        if n > 0 and len(parts) >= n:
+            parts = parts[:n]
+
+        fracs: List[Fraction] = []
+        for p in parts:
+            try:
+                f = Fraction(p)
+            except Exception:
+                try:
+                    f = Fraction(str(float(p)))
+                except Exception:
+                    return ":".join(parts)
+            fracs.append(f.limit_denominator(1000))
+
+        den_lcm = 1
+        for f in fracs:
+            den_lcm = den_lcm * f.denominator // math.gcd(den_lcm, f.denominator)
+
+        ints = [f.numerator * (den_lcm // f.denominator) for f in fracs]
+        if any(i <= 0 for i in ints):
+            return ":".join(parts)
+
+        g = 0
+        for i in ints:
+            g = math.gcd(g, abs(i))
+        if g:
+            ints = [i // g for i in ints]
+
+        return ":".join(str(i) for i in ints)
+
+    @staticmethod
+    def _scaled_ratio_ints(
+        molar_ratio: Any, expected_num_components: int
+    ) -> Optional[List[int]]:
+        """Parse molar_ratio into a scale-invariant integer vector.
+
+        Returns:
+        - list[int] of length expected_num_components when successful
+        - None if parsing fails
+        """
+        s = str(molar_ratio or "").strip()
+        if not s:
+            return None
+
+        parts = [p.strip() for p in s.split(":") if p.strip()]
+        n = int(expected_num_components or 0)
+        if n <= 0:
+            return None
+        if len(parts) < n:
+            return None
+        parts = parts[:n]
+
+        fracs: List[Fraction] = []
+        for p in parts:
+            try:
+                f = Fraction(p)
+            except Exception:
+                try:
+                    f = Fraction(str(float(p)))
+                except Exception:
+                    return None
+            f = f.limit_denominator(1000)
+            if f <= 0:
+                return None
+            fracs.append(f)
+
+        den_lcm = 1
+        for f in fracs:
+            den_lcm = den_lcm * f.denominator // math.gcd(den_lcm, f.denominator)
+
+        ints = [int(f.numerator * (den_lcm // f.denominator)) for f in fracs]
+        if any(i <= 0 for i in ints):
+            return None
+
+        g = 0
+        for i in ints:
+            g = math.gcd(g, abs(i))
+        if g:
+            ints = [i // g for i in ints]
+
+        if len(ints) != n:
+            return None
+        return ints
+
+    @staticmethod
+    def _extract_components_norm(
+        formulation: Any, expected_num_components: int
+    ) -> List[str]:
+        """Extract normalized component names from a formulation dict."""
+        if not isinstance(formulation, dict):
+            return []
+
+        if int(expected_num_components or 0) == 2:
+            hbd = normalize_component_name(formulation.get("HBD"))
+            hba = normalize_component_name(formulation.get("HBA"))
+            out = [hbd, hba]
+            return [x for x in out if x]
+
+        comps = formulation.get("components")
+        if not isinstance(comps, list):
+            return []
+
+        out: List[str] = []
+        for c in comps:
+            if isinstance(c, dict):
+                name = c.get("name")
+            else:
+                name = c
+            n = normalize_component_name(name)
+            if n:
+                out.append(n)
+        return out
+
+    def _scaled_formulation_signature(
+        self, formulation: Any, expected_num_components: int
+    ) -> str:
+        """Compute a scale-invariant, order-invariant signature for similarity checks."""
+        if not isinstance(formulation, dict):
+            return ""
+
+        n = int(expected_num_components or 0)
+        if n <= 0:
+            return ""
+
+        comps_norm = self._extract_components_norm(formulation, n)
+        if len(comps_norm) < n:
+            return ""
+
+        ints = self._scaled_ratio_ints(formulation.get("molar_ratio"), n)
+        if not ints:
+            # Fallback to non-scaled signature when ratios are not parseable.
+            return compute_formulation_signature(formulation, n)
+
+        # Map component -> ratio_int in the given order, then sort by component name.
+        # If duplicates exist, sum them to keep signature stable.
+        mapping: Dict[str, int] = {}
+        for name, r in zip(comps_norm[:n], ints[:n]):
+            if not name:
+                continue
+            mapping[name] = int(mapping.get(name, 0)) + int(r)
+
+        if not mapping:
+            return ""
+
+        body = "|".join([f"{k}={mapping[k]}" for k in sorted(mapping.keys())])
+        return f"sig_scaled_v1|n={n}|{body}"
+
+    def _similarity_gate_check(
+        self,
+        candidate_formulation: Any,
+        *,
+        task: Dict[str, Any],
+        expected_num_components: int,
+        prior_candidates: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Deterministic similarity gate to prevent near-duplicate recommendations.
+
+        Returns a dict:
+        - passed: bool
+        - reasons: list[str] (reason codes)
+        - conflicts: list[dict] (top similar items for debugging/prompting)
+        """
+        cfg = (self.config.get("agent", {}) or {}).get("similarity_gate", {}) or {}
+        enabled = bool(cfg.get("enabled", True))
+        if not enabled:
+            return {"passed": True, "reasons": [], "conflicts": []}
+
+        n = int(expected_num_components or 0)
+        if n <= 0:
+            return {"passed": True, "reasons": [], "conflicts": []}
+
+        # How far we must move in component space.
+        # Relaxed rule: changing at least one component is enough to pass the
+        # similarity gate, even for multi-component formulations.
+        default_min_changes = 1
+        min_component_changes = int(
+            cfg.get("min_component_changes", default_min_changes)
+        )
+        min_component_changes = max(1, min(min_component_changes, max(1, n)))
+        max_overlap = max(0, n - min_component_changes)
+
+        # Only check a bounded window of history for latency.
+        history_limit = int(cfg.get("history_check_limit", 200))
+        history = self._collect_recent_recommendations_for_dedup_prompt(
+            task,
+            expected_num_components=n,
+            limit=history_limit,
+        )
+
+        cand_norm = normalize_formulation(candidate_formulation, n)
+        cand_comps = self._extract_components_norm(cand_norm, n)
+        cand_set = set(cand_comps)
+        cand_sig = self._scaled_formulation_signature(cand_norm, n)
+
+        if not cand_set:
+            return {"passed": True, "reasons": [], "conflicts": []}
+
+        reasons: List[str] = []
+        conflicts: List[Dict[str, Any]] = []
+
+        def _consider(
+            *,
+            source: str,
+            rec_id: str,
+            summary: str,
+            comps_norm: List[str],
+            ratio_raw: str,
+        ) -> None:
+            nonlocal reasons, conflicts
+            hs = set([x for x in (comps_norm or []) if x])
+            if not hs:
+                return
+
+            overlap = len(cand_set & hs)
+
+            # Primary: component overlap too high.
+            if overlap > max_overlap:
+                reasons.append("too_similar_history_components")
+                conflicts.append(
+                    {
+                        "source": source,
+                        "recommendation_id": rec_id,
+                        "overlap": overlap,
+                        "component_count": n,
+                        "summary": summary,
+                    }
+                )
+                return
+
+            # Secondary: exact (scale-invariant) signature match.
+            if cand_sig:
+                try:
+                    dummy = None
+                    if n == 2:
+                        dummy = {
+                            "HBD": (comps_norm[0] if len(comps_norm) > 0 else ""),
+                            "HBA": (comps_norm[1] if len(comps_norm) > 1 else ""),
+                            "molar_ratio": ratio_raw,
+                        }
+                    else:
+                        dummy = {
+                            "components": [{"name": x} for x in (comps_norm or [])],
+                            "molar_ratio": ratio_raw,
+                        }
+                    hsig = self._scaled_formulation_signature(dummy, n)
+                    if hsig and hsig == cand_sig:
+                        reasons.append("too_similar_history_signature")
+                        conflicts.append(
+                            {
+                                "source": source,
+                                "recommendation_id": rec_id,
+                                "overlap": overlap,
+                                "component_count": n,
+                                "summary": summary,
+                            }
+                        )
+                except Exception:
+                    return
+
+        # Compare against recent recommendation history (including PENDING).
+        for h in history:
+            if not isinstance(h, dict):
+                continue
+            rec_id = str(h.get("recommendation_id") or "").strip()
+            summary = str(h.get("formulation_summary") or "").strip()
+            ratio_raw = str(h.get("ratio_raw") or h.get("ratio_bucket") or "").strip()
+            comps_norm = h.get("components_norm")
+            if not isinstance(comps_norm, list):
+                continue
+            _consider(
+                source="history",
+                rec_id=rec_id,
+                summary=summary,
+                comps_norm=[str(x) for x in comps_norm if x is not None],
+                ratio_raw=ratio_raw,
+            )
+
+        # Compare against prior candidates in this task (prevents within-task loops).
+        for i, pc in enumerate(prior_candidates or [], 1):
+            if not isinstance(pc, dict):
+                continue
+            f = pc.get("formulation")
+            try:
+                f_norm = normalize_formulation(f, n)
+            except Exception:
+                f_norm = f
+            comps_norm = self._extract_components_norm(f_norm, n)
+            ratio_raw = (
+                str((f_norm or {}).get("molar_ratio") or "")
+                if isinstance(f_norm, dict)
+                else ""
+            )
+            _consider(
+                source="prior_candidate",
+                rec_id=f"candidate#{i}",
+                summary=summarize_formulation(f_norm),
+                comps_norm=comps_norm,
+                ratio_raw=ratio_raw,
+            )
+
+        # Keep only the most informative conflicts.
+        conflicts.sort(key=lambda x: int(x.get("overlap") or 0), reverse=True)
+        reasons_unique: List[str] = []
+        for r in reasons:
+            if r not in reasons_unique:
+                reasons_unique.append(r)
+
+        passed = len(reasons_unique) == 0
+        return {
+            "passed": passed,
+            "reasons": reasons_unique,
+            "conflicts": conflicts[:3],
+            "min_component_changes": min_component_changes,
+            "max_overlap": max_overlap,
+        }
+
+    def _build_non_duplication_block_for_prompt(
+        self,
+        *,
+        task: Dict[str, Any],
+        expected_num_components: int,
+        prior_candidates: Optional[List[Dict[str, Any]]] = None,
+        baselines: Optional[List[BaselineRecord]] = None,
+    ) -> str:
+        """Build a compact prompt block to discourage repeat formulations."""
+        prior_candidates = prior_candidates or []
+        baselines = baselines or []
+
+        agent_cfg = self.config.get("agent", {}) or {}
+        history_limit = int(agent_cfg.get("history_injection_limit", 12))
+
+        history = self._collect_recent_recommendations_for_dedup_prompt(
+            task,
+            expected_num_components=expected_num_components,
+            limit=history_limit,
+        )
+
+        # Avoid repeating the same items already listed as "Validated Baselines".
+        baseline_ids = {
+            b.baseline_id for b in baselines if getattr(b, "baseline_id", None)
+        }
+        history = [
+            h
+            for h in history
+            if str(h.get("recommendation_id") or "") not in baseline_ids
+        ]
+
+        attempted_lines: List[str] = []
+        tail = prior_candidates[-6:]
+        base_index = len(prior_candidates) - len(tail) + 1
+        for offset, cand in enumerate(tail):
+            if not isinstance(cand, dict):
+                continue
+            try:
+                f_norm = normalize_formulation(
+                    cand.get("formulation"), expected_num_components
+                )
+            except Exception:
+                f_norm = cand.get("formulation")
+            summary = summarize_formulation(f_norm).strip()
+            if summary == "<invalid formulation>":
+                continue
+            attempted_lines.append(f"- candidate#{base_index + offset}: {summary}")
+
+        history_lines: List[str] = []
+        for h in history:
+            rec_id = str(h.get("recommendation_id") or "").strip()
+            if not rec_id:
+                continue
+            status = str(h.get("status") or "UNKNOWN").strip()
+            t = h.get("target_temperature")
+            t_txt = f"{t}C" if t is not None else "N/A"
+            summary = str(h.get("formulation_summary") or "").strip()
+            if not summary:
+                continue
+            history_lines.append(f"- {rec_id} (status={status}, T={t_txt}): {summary}")
+
+        # Build compact "recently used" pools to discourage overly similar formulations.
+        recent_components: List[str] = []
+        recent_components_seen: set[str] = set()
+        recent_ratio_buckets: List[str] = []
+        recent_ratio_seen: set[str] = set()
+        recent_pairs: List[str] = []
+        recent_pair_seen: set[str] = set()
+
+        def _add_component(norm: str, display: str) -> None:
+            n = str(norm or "").strip()
+            if not n or n in recent_components_seen:
+                return
+            recent_components_seen.add(n)
+            d = str(display or "").strip()
+            recent_components.append(d if d else n)
+
+        def _add_ratio(bucket: str) -> None:
+            b = str(bucket or "").strip()
+            if not b or b in recent_ratio_seen:
+                return
+            recent_ratio_seen.add(b)
+            recent_ratio_buckets.append(b)
+
+        def _add_pair(pair_key: str, pair_display: str) -> None:
+            k = str(pair_key or "").strip()
+            if not k or k in recent_pair_seen:
+                return
+            recent_pair_seen.add(k)
+            d = str(pair_display or "").strip()
+            recent_pairs.append(d if d else k)
+
+        # From historical recommendations (index-based)
+        for h in history:
+            cn = h.get("components_norm")
+            cd = h.get("components_display")
+            if isinstance(cn, list):
+                for i, n in enumerate(cn):
+                    disp = ""
+                    if isinstance(cd, list) and i < len(cd):
+                        disp = str(cd[i] or "")
+                    _add_component(str(n), disp)
+
+            _add_ratio(str(h.get("ratio_bucket") or ""))
+
+            if expected_num_components == 2:
+                _add_pair(
+                    str(h.get("pair_key") or ""), str(h.get("pair_display") or "")
+                )
+
+        # Also include prior candidates from this task (prevents within-task near-duplicates)
+        for cand in prior_candidates:
+            if not isinstance(cand, dict):
+                continue
+            try:
+                f_norm = normalize_formulation(
+                    cand.get("formulation"), expected_num_components
+                )
+            except Exception:
+                f_norm = cand.get("formulation")
+
+            if not isinstance(f_norm, dict):
+                continue
+
+            if expected_num_components == 2:
+                hbd = str(f_norm.get("HBD") or "").strip()
+                hba = str(f_norm.get("HBA") or "").strip()
+                if hbd and hba:
+                    hbd_n = normalize_component_name(hbd)
+                    hba_n = normalize_component_name(hba)
+                    _add_component(hbd_n, hbd)
+                    _add_component(hba_n, hba)
+                    if hbd_n and hba_n:
+                        _add_pair(
+                            "|".join(sorted([hbd_n, hba_n])),
+                            f"{hbd} + {hba}",
+                        )
+            else:
+                comps = f_norm.get("components")
+                if isinstance(comps, list):
+                    for c in comps:
+                        if isinstance(c, dict):
+                            name = str(c.get("name") or "").strip()
+                        else:
+                            name = str(c or "").strip()
+                        if not name:
+                            continue
+                        _add_component(normalize_component_name(name), name)
+
+            _add_ratio(
+                self._normalize_ratio_bucket(
+                    f_norm.get("molar_ratio"), expected_num_components
+                )
+            )
+
+        # Also include validated baselines into pools (they are part of history, even if
+        # we excluded them from the history list to avoid duplicating content).
+        def _parse_signature_pairs(sig: Any) -> List[Tuple[str, str]]:
+            s = str(sig or "").strip()
+            if not s:
+                return []
+            toks = [t.strip() for t in s.split("|") if t.strip()]
+            pairs: List[Tuple[str, str]] = []
+            for t in toks:
+                if not t or "=" not in t:
+                    continue
+                if t.startswith("n="):
+                    continue
+                name, ratio = t.split("=", 1)
+                name = name.strip()
+                ratio = ratio.strip()
+                if not name:
+                    continue
+                pairs.append((name, ratio))
+            return pairs
+
+        for b in baselines:
+            sig_pairs = _parse_signature_pairs(getattr(b, "signature", ""))
+            if not sig_pairs:
+                continue
+
+            names = [n for n, _ in sig_pairs if n]
+            ratios = [r for _, r in sig_pairs if r]
+            for n in names:
+                _add_component(n, n)
+
+            if ratios:
+                _add_ratio(
+                    self._normalize_ratio_bucket(
+                        ":".join(ratios), expected_num_components
+                    )
+                )
+
+            # Binary-only: treat baseline pairs as part of the pair pool.
+            if expected_num_components == 2 and len(names) >= 2:
+                pair_key = "|".join(sorted(names))
+                pair_disp = str(getattr(b, "formulation_summary", "") or "").strip()
+                pair_disp = re.sub(r"\s*\([^)]*\)\s*$", "", pair_disp).strip()
+                _add_pair(pair_key, pair_disp)
+
+        def _format_truncated(items: List[str], max_items: int) -> str:
+            xs = [str(x).strip() for x in (items or []) if str(x).strip()]
+            if not xs:
+                return ""
+            if len(xs) <= max_items:
+                return ", ".join(xs)
+            return ", ".join(xs[:max_items]) + f" ... (+{len(xs) - max_items} more)"
+
+        has_any = bool(
+            attempted_lines
+            or history_lines
+            or recent_components
+            or recent_ratio_buckets
+            or recent_pairs
+        )
+        if not has_any:
+            return ""
+
+        lines: List[str] = []
+        lines.append("## Non-Duplication & Diversity Constraints (Critical)\n")
+        lines.append(
+            "Hard rule (MUST): Do NOT recommend a formulation that repeats any formulation listed in this section OR any validated baseline shown earlier in this prompt. "
+            "Treat re-ordering, re-spacing, and trivial renaming as the same. "
+            "Treat proportional molar-ratio scaling as the same formulation (e.g., 1:2 is the same as 2:4).\n"
+        )
+        lines.append(
+            "Diversity rule (MUST): Avoid overly similar formulations. A candidate is sufficiently different for this gate if it changes "
+            "at least ONE component identity relative to recent history. A ratio-only tweak is NOT sufficient. Reusing a familiar molar-ratio bucket is allowed "
+            "when the component set has changed.\n"
+        )
+
+        if expected_num_components == 2:
+            lines.append("Binary diversity requirements (MUST):")
+            lines.append(
+                "- Do NOT reuse any previously used HBD+HBA pair shown in this prompt (including baselines + history), even with a different ratio."
+            )
+            lines.append(
+                "- At least ONE of {HBD, HBA} must be outside the recently used component pool."
+            )
+            lines.append(
+                "- Prefer a fresh molar_ratio bucket, but this is NOT required if at least one of {HBD, HBA} is new."
+            )
+            lines.append(
+                "- If strict compliance is impossible due to hard constraints (availability/toxicity/etc.), justify any reuse in the reasoning and maximize novelty in the other dimension."
+            )
+            lines.append("")
+        else:
+            lines.append("Multi-component diversity requirements (MUST):")
+            lines.append(
+                "- Include at least ONE component outside the recently used component pool."
+            )
+            lines.append(
+                "- Prefer a fresh molar_ratio pattern, but this is NOT required if at least ONE component is new."
+            )
+            lines.append(
+                "- If strict compliance is impossible due to hard constraints (availability/toxicity/etc.), justify any reuse in the reasoning and maximize novelty in the other dimension."
+            )
+            lines.append("")
+
+        pool_lines: List[str] = []
+        if expected_num_components == 2 and recent_pairs:
+            pool_lines.append(
+                f"- binary_pairs (avoid): {_format_truncated(recent_pairs, 12)}"
+            )
+        if recent_components:
+            pool_lines.append(
+                f"- components (avoid if possible): {_format_truncated(recent_components, 18)}"
+            )
+        if recent_ratio_buckets:
+            pool_lines.append(
+                f"- ratio_buckets (avoid): {_format_truncated(recent_ratio_buckets, 12)}"
+            )
+
+        if pool_lines:
+            lines.append(
+                "Recently used pools (baselines + history + current attempts):"
+            )
+            lines.extend(pool_lines)
+            if expected_num_components == 2:
+                suggested = [
+                    "1:1",
+                    "1:2",
+                    "1:3",
+                    "1:4",
+                    "2:1",
+                    "3:1",
+                    "4:1",
+                    "1:5",
+                    "5:1",
+                ]
+                lines.append(f"- suggested_ratio_buckets: {', '.join(suggested)}")
+            lines.append("")
+
+        if attempted_lines:
+            lines.append("Already attempted in this task (do not repeat):")
+            lines.extend(attempted_lines)
+            lines.append("")
+
+        if history_lines:
+            lines.append(
+                "Historical recommendations under similar target conditions (do not repeat):"
+            )
+            lines.extend(history_lines)
+            lines.append("")
+
+        return "\n".join(lines)
 
     # ===== P2: Action policy helpers (query budgets + anti-parallel default) =====
 
@@ -876,13 +1877,17 @@ Output JSON:
 
         return False
 
-    def _count_valid_candidates(self, candidates: List[Any], expected_num_components: int) -> int:
+    def _count_valid_candidates(
+        self, candidates: List[Any], expected_num_components: int
+    ) -> int:
         """Count schema-valid formulation candidates currently in the knowledge_state."""
         n = 0
         for cand in candidates or []:
             if not isinstance(cand, dict):
                 continue
-            f_norm = normalize_formulation(cand.get("formulation"), expected_num_components)
+            f_norm = normalize_formulation(
+                cand.get("formulation"), expected_num_components
+            )
             ok_f, _ = validate_formulation(
                 f_norm, expected_num_components, require_functions=True
             )
@@ -920,7 +1925,11 @@ Output JSON:
         - Stop early when we already have a valid, testable formulation.
         """
         if not isinstance(thought, dict):
-            return {"action": "generate_formulation", "reasoning": "Invalid thought object", "information_gaps": []}
+            return {
+                "action": "generate_formulation",
+                "reasoning": "Invalid thought object",
+                "information_gaps": [],
+            }
 
         thought.setdefault("action", "generate_formulation")
         thought.setdefault("reasoning", "")
@@ -949,12 +1958,19 @@ Output JSON:
         num_parallel = int(knowledge_state.get("num_parallel_queries", 0))
         num_candidates = len(knowledge_state.get("formulation_candidates") or [])
 
+        failed_theory = int(knowledge_state.get("failed_theory_attempts", 0))
+        failed_lit = int(knowledge_state.get("failed_literature_attempts", 0))
+
         last_obs = None
         if knowledge_state.get("observations"):
             maybe = (knowledge_state.get("observations") or [])[-1]
             last_obs = maybe if isinstance(maybe, dict) else None
 
-        info_sufficient = bool(last_obs.get("information_sufficient")) if isinstance(last_obs, dict) else False
+        info_sufficient = (
+            bool(last_obs.get("information_sufficient"))
+            if isinstance(last_obs, dict)
+            else False
+        )
 
         # 1) If we already have an ACCEPTED candidate and info is sufficient -> finish now.
         if num_accepted > 0 and info_sufficient:
@@ -971,17 +1987,46 @@ Output JSON:
 
         # 1.5) Never finish unless an ACCEPTED candidate exists.
         if action == "finish" and num_accepted == 0:
-            action = "generate_formulation" if num_candidates == 0 else "refine_formulation"
+            action = (
+                "generate_formulation" if num_candidates == 0 else "refine_formulation"
+            )
             override_reason = "No ACCEPTED candidate exists; cannot finish yet."
 
         # 2) Enforce query budgets (CoreRAG/LargeRAG/parallel).
         if action == "query_theory" and num_theory >= max_corerag:
-            action = "query_literature" if self.largerag and num_lit < max_largerag else "generate_formulation"
+            action = (
+                "query_literature"
+                if self.largerag and num_lit < max_largerag
+                else "generate_formulation"
+            )
             override_reason = f"CoreRAG budget reached (>= {max_corerag}); avoiding additional theory queries."
 
         if action == "query_literature" and num_lit >= max_largerag:
             action = "generate_formulation"
-            override_reason = f"LargeRAG budget reached (>= {max_largerag}); moving to formulation."
+            override_reason = (
+                f"LargeRAG budget reached (>= {max_largerag}); moving to formulation."
+            )
+
+        # 2.5) Enforce hard failure stops (deterministic; do not rely on prompt compliance).
+        if action == "query_theory" and failed_theory >= 2:
+            action = (
+                "generate_formulation" if num_candidates == 0 else "refine_formulation"
+            )
+            override_reason = (
+                "CoreRAG failed >= 2 times; stop theory queries and move on."
+            )
+        if action == "query_literature" and failed_lit >= 2:
+            action = (
+                "generate_formulation" if num_candidates == 0 else "refine_formulation"
+            )
+            override_reason = (
+                "LargeRAG failed >= 2 times; stop literature queries and move on."
+            )
+        if action == "query_parallel" and (failed_theory >= 2 or failed_lit >= 2):
+            action = (
+                "generate_formulation" if num_candidates == 0 else "refine_formulation"
+            )
+            override_reason = "Tool failures detected (>=2); avoid query_parallel and move to formulation."
 
         if action == "query_parallel":
             # query_parallel is never the default; allow only when BOTH are missing and budget allows.
@@ -989,24 +2034,42 @@ Output JSON:
             has_lit = num_lit > 0
 
             if num_parallel >= max_parallel:
-                action = "query_literature" if self.largerag and num_lit < max_largerag else "generate_formulation"
+                action = (
+                    "query_literature"
+                    if self.largerag and num_lit < max_largerag
+                    else "generate_formulation"
+                )
                 override_reason = f"query_parallel budget reached (>= {max_parallel}); avoid running both tools again."
             elif has_theory and not has_lit:
                 action = "query_literature" if self.largerag else "generate_formulation"
                 override_reason = "Already have theory; query literature only (avoid unnecessary CoreRAG)."
             elif has_lit and not has_theory:
-                action = "query_theory" if self.corerag and num_theory < max_corerag else "generate_formulation"
-                override_reason = "Already have literature; query theory only if budget allows."
+                action = (
+                    "query_theory"
+                    if self.corerag and num_theory < max_corerag
+                    else "generate_formulation"
+                )
+                override_reason = (
+                    "Already have literature; query theory only if budget allows."
+                )
             elif has_theory and has_lit:
                 # When both exist, parallel adds cost but rarely adds decisive value.
-                action = "generate_formulation" if num_candidates == 0 else "refine_formulation"
+                action = (
+                    "generate_formulation"
+                    if num_candidates == 0
+                    else "refine_formulation"
+                )
                 override_reason = "Already have theory + literature; move to formulation instead of parallel querying."
             else:
                 # Both missing: allow at most once (budgeted) early in the run.
                 pass
 
         # 3) Stagnation: if gaps repeat, stop searching and write/refine.
-        if stagnating and action in ("query_theory", "query_literature", "query_parallel"):
+        if stagnating and action in (
+            "query_theory",
+            "query_literature",
+            "query_parallel",
+        ):
             if num_candidates == 0:
                 action = "generate_formulation"
                 override_reason = "Stagnation detected (repeating information gaps); stop querying and generate a candidate."
@@ -1015,7 +2078,9 @@ Output JSON:
                 override_reason = "Stagnation detected and an ACCEPTED candidate exists; finishing early."
             else:
                 action = "refine_formulation"
-                override_reason = "Stagnation detected; refine candidates instead of more searching."
+                override_reason = (
+                    "Stagnation detected; refine candidates instead of more searching."
+                )
 
         # 4) Encourage earlier formulation once sufficient sources exist.
         # If we already have both theory+literature and still no candidates, don't keep querying.
@@ -1032,7 +2097,9 @@ Output JSON:
         # 5) Final rounds: prioritize producing/finishing.
         if remaining <= 2 and action in ("query_theory", "query_parallel"):
             # CoreRAG is slow; late-stage parallel/theory is rarely worth it.
-            action = "generate_formulation" if num_candidates == 0 else "refine_formulation"
+            action = (
+                "generate_formulation" if num_candidates == 0 else "refine_formulation"
+            )
             override_reason = "Final rounds policy: avoid slow theory/parallel queries; focus on formulation output."
 
         # Ensure tools exist for the chosen query action.
@@ -1040,24 +2107,36 @@ Output JSON:
             action = "query_literature" if self.largerag else "generate_formulation"
             override_reason = "CoreRAG unavailable; switching action."
         if action == "query_literature" and not self.largerag:
-            action = "query_theory" if self.corerag and num_theory < max_corerag else "generate_formulation"
+            action = (
+                "query_theory"
+                if self.corerag and num_theory < max_corerag
+                else "generate_formulation"
+            )
             override_reason = "LargeRAG unavailable; switching action."
         if action == "query_parallel" and not (self.corerag or self.largerag):
             action = "generate_formulation"
-            override_reason = "No tools available for query_parallel; switching to formulation."
+            override_reason = (
+                "No tools available for query_parallel; switching to formulation."
+            )
 
         # Apply override
         if action != original_action:
             thought["action"] = action
-            prefix = f"Policy override: {override_reason}" if override_reason else "Policy override applied."
-            thought["reasoning"] = (prefix + "\n" + str(thought.get("reasoning") or "").strip()).strip()
+            prefix = (
+                f"Policy override: {override_reason}"
+                if override_reason
+                else "Policy override applied."
+            )
+            thought["reasoning"] = (
+                prefix + "\n" + str(thought.get("reasoning") or "").strip()
+            ).strip()
 
         return thought
 
     def _parse_json_response(self, llm_output: str) -> Dict:
         """Parse JSON from LLM response with multiple fallback strategies."""
         # Try to extract JSON block
-        json_match = re.search(r'```json\s*(.*?)\s*```', llm_output, re.DOTALL)
+        json_match = re.search(r"```json\s*(.*?)\s*```", llm_output, re.DOTALL)
         if json_match:
             try:
                 return json.loads(json_match.group(1))
@@ -1065,7 +2144,7 @@ Output JSON:
                 pass
 
         # Try to find any JSON object
-        json_match = re.search(r'\{.*?\}', llm_output, re.DOTALL)
+        json_match = re.search(r"\{.*?\}", llm_output, re.DOTALL)
         if json_match:
             try:
                 return json.loads(json_match.group(0))
@@ -1076,7 +2155,9 @@ Output JSON:
         logger.warning("Could not parse JSON from LLM output")
         return {}
 
-    def _query_tools_parallel(self, task: Dict, knowledge_state: Dict) -> Tuple[Optional[Dict], Optional[Dict]]:
+    def _query_tools_parallel(
+        self, task: Dict, knowledge_state: Dict
+    ) -> Tuple[Optional[Dict], Optional[Dict]]:
         """
         Query CoreRAG and LargeRAG in parallel for efficiency.
 
@@ -1086,7 +2167,9 @@ Output JSON:
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            result = loop.run_until_complete(self._query_tools_parallel_async(task, knowledge_state))
+            result = loop.run_until_complete(
+                self._query_tools_parallel_async(task, knowledge_state)
+            )
             loop.close()
             return result
         except Exception as e:
@@ -1098,13 +2181,21 @@ Output JSON:
 
             theory = None
             literature = None
-            if self.corerag and int(knowledge_state.get("num_theory_queries", 0)) < max_corerag:
+            if (
+                self.corerag
+                and int(knowledge_state.get("num_theory_queries", 0)) < max_corerag
+            ):
                 theory = self._query_corerag(task, knowledge_state)
-            if self.largerag and int(knowledge_state.get("num_literature_queries", 0)) < max_largerag:
+            if (
+                self.largerag
+                and int(knowledge_state.get("num_literature_queries", 0)) < max_largerag
+            ):
                 literature = self._query_largerag(task, knowledge_state)
             return theory, literature
 
-    async def _query_tools_parallel_async(self, task: Dict, knowledge_state: Dict) -> Tuple[Optional[Dict], Optional[Dict]]:
+    async def _query_tools_parallel_async(
+        self, task: Dict, knowledge_state: Dict
+    ) -> Tuple[Optional[Dict], Optional[Dict]]:
         """Async version of parallel tool query."""
         loop = asyncio.get_event_loop()
 
@@ -1117,18 +2208,28 @@ Output JSON:
         agent_cfg = self.config.get("agent", {}) or {}
         max_corerag = int(agent_cfg.get("max_corerag_queries", 3))
         max_largerag = int(agent_cfg.get("max_largerag_queries", 8))
-        allow_corerag = bool(self.corerag) and int(knowledge_state.get("num_theory_queries", 0)) < max_corerag
-        allow_largerag = bool(self.largerag) and int(knowledge_state.get("num_literature_queries", 0)) < max_largerag
+        allow_corerag = (
+            bool(self.corerag)
+            and int(knowledge_state.get("num_theory_queries", 0)) < max_corerag
+        )
+        allow_largerag = (
+            bool(self.largerag)
+            and int(knowledge_state.get("num_literature_queries", 0)) < max_largerag
+        )
 
         # Create tasks
         tasks = []
         if allow_corerag:
-            tasks.append(loop.run_in_executor(None, self._query_corerag, task, knowledge_state))
+            tasks.append(
+                loop.run_in_executor(None, self._query_corerag, task, knowledge_state)
+            )
         else:
             tasks.append(return_none())
 
         if allow_largerag:
-            tasks.append(loop.run_in_executor(None, self._query_largerag, task, knowledge_state))
+            tasks.append(
+                loop.run_in_executor(None, self._query_largerag, task, knowledge_state)
+            )
         else:
             tasks.append(return_none())
 
@@ -1169,14 +2270,20 @@ Output JSON:
                 - status: "PENDING"
                 - iterations_used: Number of ReAct iterations
         """
-        task_id = task.get("task_id", f"task_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-        logger.info(f"[ReAct Agent] Starting task {task_id}: {task['description'][:50]}...")
+        task_id = task.get(
+            "task_id", f"task_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+        logger.info(
+            f"[ReAct Agent] Starting task {task_id}: {task['description'][:50]}..."
+        )
 
         # Fix the expected component count early so policies/baselines use the same value.
         agent_cfg = self.config.get("agent", {}) or {}
         default_num_components = int(agent_cfg.get("default_num_components", 2) or 2)
         try:
-            expected_num_components = int(task.get("num_components") or default_num_components)
+            expected_num_components = int(
+                task.get("num_components") or default_num_components
+            )
         except Exception:
             expected_num_components = default_num_components
         task["num_components"] = expected_num_components
@@ -1214,22 +2321,24 @@ Output JSON:
         # ===== ReAct Loop =====
         while iteration < max_iterations and not task_complete:
             iteration += 1
-            logger.info(f"\n{'='*60}")
+            logger.info(f"\n{'=' * 60}")
             logger.info(f"[ReAct Iteration {iteration}/{max_iterations}]")
-            logger.info(f"{'='*60}")
+            logger.info(f"{'=' * 60}")
 
             # THINK: Decide next action based on current knowledge state
             thought = self._think(task, knowledge_state, iteration)
             logger.info(f"[THINK] {thought['reasoning']}")
             logger.info(f"[THINK] Next action: {thought['action']}")
 
-            trajectory_steps.append({
-                "iteration": iteration,
-                "phase": "think",
-                "reasoning": thought["reasoning"],
-                "action": thought["action"],
-                "information_gaps": thought.get("information_gaps", [])
-            })
+            trajectory_steps.append(
+                {
+                    "iteration": iteration,
+                    "phase": "think",
+                    "reasoning": thought["reasoning"],
+                    "action": thought["action"],
+                    "information_gaps": thought.get("information_gaps", []),
+                }
+            )
 
             # Check if ready to finish
             if thought["action"] == "finish":
@@ -1238,15 +2347,19 @@ Output JSON:
                 break
 
             # ACT: Execute the chosen action
-            action_result = self._act(thought["action"], task, knowledge_state, tool_calls)
+            action_result = self._act(
+                thought["action"], task, knowledge_state, tool_calls
+            )
             logger.info(f"[ACT] Executed: {thought['action']}")
 
-            trajectory_steps.append({
-                "iteration": iteration,
-                "phase": "act",
-                "action": thought["action"],
-                "result_summary": action_result.get("summary", "")
-            })
+            trajectory_steps.append(
+                {
+                    "iteration": iteration,
+                    "phase": "act",
+                    "action": thought["action"],
+                    "result_summary": action_result.get("summary", ""),
+                }
+            )
 
             # OBSERVE: Summarize and integrate new information
             observation = self._observe(action_result, knowledge_state, task, iteration)
@@ -1257,16 +2370,20 @@ Output JSON:
             # NEW: Update information_gaps from observation
             if observation.get("information_gaps"):
                 knowledge_state["information_gaps"] = observation["information_gaps"]
-                logger.debug(f"[OBSERVE] Updated information gaps: {observation['information_gaps']}")
+                logger.debug(
+                    f"[OBSERVE] Updated information gaps: {observation['information_gaps']}"
+                )
 
-            trajectory_steps.append({
-                "iteration": iteration,
-                "phase": "observe",
-                "observation": observation["summary"],
-                "knowledge_updated": observation.get("knowledge_updated", []),
-                "key_insights": observation.get("key_insights", []),
-                "information_gaps": observation.get("information_gaps", [])
-            })
+            trajectory_steps.append(
+                {
+                    "iteration": iteration,
+                    "phase": "observe",
+                    "observation": observation["summary"],
+                    "knowledge_updated": observation.get("knowledge_updated", []),
+                    "key_insights": observation.get("key_insights", []),
+                    "information_gaps": observation.get("information_gaps", []),
+                }
+            )
 
             # ===== P2: Early stopping (avoid "always run to max_iterations") =====
             #
@@ -1278,7 +2395,9 @@ Output JSON:
                 num_accepted = self._count_accepted_candidates(
                     knowledge_state.get("formulation_candidates") or []
                 )
-                stagnating = self._is_stagnating(knowledge_state.get("observations") or [])
+                stagnating = self._is_stagnating(
+                    knowledge_state.get("observations") or []
+                )
                 remaining = max_iterations - iteration
 
                 if num_accepted > 0 and (
@@ -1336,7 +2455,9 @@ Output JSON:
                 )
                 continue
 
-            f_norm = normalize_formulation(cand.get("formulation"), expected_num_components)
+            f_norm = normalize_formulation(
+                cand.get("formulation"), expected_num_components
+            )
             ok_f, f_errors = validate_formulation(
                 f_norm, expected_num_components, require_functions=True
             )
@@ -1349,7 +2470,9 @@ Output JSON:
             summary = summarize_formulation(f_norm)
             acc = cand.get("_acceptance") if isinstance(cand, dict) else None
             accepted = bool(acc.get("accepted")) if isinstance(acc, dict) else False
-            rec_class = str(acc.get("recommendation_class")) if isinstance(acc, dict) else "N/A"
+            rec_class = (
+                str(acc.get("recommendation_class")) if isinstance(acc, dict) else "N/A"
+            )
             acc_reasons = acc.get("reasons") if isinstance(acc, dict) else []
             candidate_summaries.append(
                 {
@@ -1388,9 +2511,15 @@ Output JSON:
             final_status = "FAILED"
             outcome = "rejected_by_acceptance"
 
-            acc = formulation_result.get("_acceptance") if isinstance(formulation_result, dict) else None
+            acc = (
+                formulation_result.get("_acceptance")
+                if isinstance(formulation_result, dict)
+                else None
+            )
             reasons = acc.get("reasons") if isinstance(acc, dict) else []
-            reasons_text = ", ".join([str(r) for r in (reasons or [])]) if reasons else "unknown"
+            reasons_text = (
+                ", ".join([str(r) for r in (reasons or [])]) if reasons else "unknown"
+            )
             formulation_result = dict(formulation_result)
             formulation_result.setdefault("reasoning", "")
             formulation_result["reasoning"] = (
@@ -1428,7 +2557,9 @@ Output JSON:
             formulation_result["reasoning"] = "\n".join(fail_lines)
 
         # Add memories_used to formulation_result for trajectory persistence
-        formulation_result["memories_used"] = [m.title for m in (knowledge_state["memories"] or [])]
+        formulation_result["memories_used"] = [
+            m.title for m in (knowledge_state["memories"] or [])
+        ]
 
         # ===== Create Trajectory Record =====
         trajectory = Trajectory(
@@ -1454,8 +2585,17 @@ Output JSON:
                     "had_literature": len(knowledge_state["literature_knowledge"]) > 0,
                     "num_theory_queries": knowledge_state["num_theory_queries"],
                     "num_literature_queries": knowledge_state["num_literature_queries"],
-                }
-            }
+                    "num_parallel_queries": knowledge_state.get(
+                        "num_parallel_queries", 0
+                    ),
+                    "failed_theory_attempts": knowledge_state.get(
+                        "failed_theory_attempts", 0
+                    ),
+                    "failed_literature_attempts": knowledge_state.get(
+                        "failed_literature_attempts", 0
+                    ),
+                },
+            },
         )
 
         # ===== Create Recommendation Record =====
@@ -1471,7 +2611,7 @@ Output JSON:
             trajectory=trajectory,
             status=final_status,
             created_at=datetime.now().isoformat(),
-            updated_at=datetime.now().isoformat()
+            updated_at=datetime.now().isoformat(),
         )
 
         self.rec_manager.save_recommendation(recommendation)
@@ -1487,7 +2627,7 @@ Output JSON:
         result["information_sources"] = {
             "memories": knowledge_state["memories_retrieved"],
             "theory": len(knowledge_state["theory_knowledge"]) > 0,
-            "literature": len(knowledge_state["literature_knowledge"]) > 0
+            "literature": len(knowledge_state["literature_knowledge"]) > 0,
         }
         if final_status == "PENDING":
             result["next_steps"] = (
@@ -1527,10 +2667,10 @@ Output JSON:
         # Let LLM decide how many memories to retrieve
         decision_prompt = f"""You are deciding how many memories to retrieve for a DES formulation task.
 
-**Task**: {task['description']}
-**Target Material**: {task['target_material']}
-**Target Temperature**: {task.get('target_temperature', 25)}°C
-**Constraints**: {task.get('constraints', {})}
+**Task**: {task["description"]}
+**Target Material**: {task["target_material"]}
+**Target Temperature**: {task.get("target_temperature", 25)}°C
+**Constraints**: {task.get("constraints", {})}
 
 **Memory Bank Status**:
 - Total memories available: {total_memories}
@@ -1565,22 +2705,28 @@ Output ONLY a JSON object:
             # Validate and constrain top_k
             top_k = max(1, min(top_k, total_memories, 10))
 
-            logger.info(f"[Memory Retrieval] LLM decision: retrieve top_{top_k} memories")
+            logger.info(
+                f"[Memory Retrieval] LLM decision: retrieve top_{top_k} memories"
+            )
             logger.info(f"[Memory Retrieval] Reasoning: {reasoning}")
 
         except Exception as e:
-            logger.warning(f"[Memory Retrieval] LLM decision failed: {e}, using default top_k=3")
+            logger.warning(
+                f"[Memory Retrieval] LLM decision failed: {e}, using default top_k=3"
+            )
             top_k = min(3, total_memories)
 
         # Perform retrieval with LLM-decided top_k
         query = MemoryQuery(
             query_text=task["description"],
             top_k=top_k,
-            min_similarity=self.config.get("memory", {}).get("min_similarity", 0.0)
+            min_similarity=self.config.get("memory", {}).get("min_similarity", 0.0),
         )
 
         memories = self.retriever.retrieve(query)
-        logger.info(f"[Memory Retrieval] Retrieved {len(memories)} memories (requested: {top_k}, available: {total_memories})")
+        logger.info(
+            f"[Memory Retrieval] Retrieved {len(memories)} memories (requested: {top_k}, available: {total_memories})"
+        )
 
         return memories
 
@@ -1599,6 +2745,8 @@ Output ONLY a JSON object:
             logger.warning("CoreRAG client not available")
             return None
 
+        query_text = ""
+        query = None
         try:
             # Let LLM generate the query based on current knowledge state
             num_prev_queries = knowledge_state["num_theory_queries"]
@@ -1606,9 +2754,16 @@ Output ONLY a JSON object:
             # Summarize what we already know
             prev_theory_summary = ""
             if knowledge_state["theory_knowledge"]:
-                prev_theory_summary = f"\n**Previous theory queries ({num_prev_queries} total):**\n"
-                for i, theory in enumerate(knowledge_state["theory_knowledge"][-2:], start=max(1, num_prev_queries-1)):
-                    prev_theory_summary += f"Query {i}: Retrieved theoretical knowledge\n"
+                prev_theory_summary = (
+                    f"\n**Previous theory queries ({num_prev_queries} total):**\n"
+                )
+                for i, theory in enumerate(
+                    knowledge_state["theory_knowledge"][-2:],
+                    start=max(1, num_prev_queries - 1),
+                ):
+                    prev_theory_summary += (
+                        f"Query {i}: Retrieved theoretical knowledge\n"
+                    )
 
             literature_summary = ""
             if knowledge_state["literature_knowledge"]:
@@ -1616,14 +2771,14 @@ Output ONLY a JSON object:
 
             query_gen_prompt = f"""You are generating a query for CoreRAG (theoretical ontology database) to support DES formulation design.
 
-**Task**: {task['description']}
-**Target Material**: {task['target_material']}
-**Temperature**: {task.get('target_temperature', 25)}°C
-**Constraints**: {task.get('constraints', {})}
+**Task**: {task["description"]}
+**Target Material**: {task["target_material"]}
+**Temperature**: {task.get("target_temperature", 25)}°C
+**Constraints**: {task.get("constraints", {})}
 
 **Current Knowledge State**:
 - Theory queries completed: {num_prev_queries}
-- Literature queries completed: {knowledge_state['num_literature_queries']}
+- Literature queries completed: {knowledge_state["num_literature_queries"]}
 {prev_theory_summary}
 {literature_summary}
 
@@ -1635,18 +2790,47 @@ Output ONLY a JSON object:
 - Be specific and detailed to maximize information gain
 - CoreRAG takes 5-10 minutes per query, so make it count!
 
+- Output MUST be a NON-EMPTY query string. If unsure, output a broad mechanistic/design-rule query anchored to the target material.
+
 Output ONLY the query text (no JSON, no explanation):"""
 
             query_text = self.llm_client(query_gen_prompt).strip()
             # Remove quotes if LLM added them
             query_text = query_text.strip('"').strip("'")
+            query_text = query_text.replace("```", " ")
+            query_text = re.sub(r"\s+", " ", query_text).strip()
 
-            logger.info(f"[CoreRAG Query #{num_prev_queries + 1}] LLM generated: {query_text[:100]}...")
+            # Guardrail: never send empty/degenerate queries to CoreRAG.
+            if not query_text or query_text.lower() in ("none", "null", "n/a"):
+                target = str(task.get("target_material") or "").strip()
+                temp = normalize_temperature_C(task.get("target_temperature"))
+                temp = 25.0 if temp is None else temp
+                query_text = (
+                    f"Mechanistic and design rules for DES formulation to dissolve/leach {target} at {temp}C. "
+                    "Cover acidity/proton activity, halide complexation, chelation, viscosity/mass transfer, and water-in-DES effects."
+                    if target
+                    else f"Mechanistic and design rules for DES formulation at {temp}C (acidity, complexation, viscosity, water-in-DES)."
+                )
+                query_text = re.sub(r"\s+", " ", query_text).strip()
+                logger.warning(
+                    "[CoreRAG Query #%s] Empty query generated by LLM; using fallback query: %s",
+                    num_prev_queries + 1,
+                    query_text[:120],
+                )
+
+            logger.info(
+                f"[CoreRAG Query #{num_prev_queries + 1}] LLM generated: {query_text[:100]}..."
+            )
 
             # Format query for CoreRAG
             query = {
                 "query": query_text,
-                "focus": ["hydrogen_bonding", "component_selection", "molar_ratio", "temperature_effects"]
+                "focus": [
+                    "hydrogen_bonding",
+                    "component_selection",
+                    "molar_ratio",
+                    "temperature_effects",
+                ],
             }
 
             # Call CoreRAG
@@ -1667,8 +2851,13 @@ Output ONLY the query text (no JSON, no explanation):"""
             }
 
         except Exception as e:
-            logger.error(f"CoreRAG query failed: {e}")
-            return None
+            logger.error(f"CoreRAG query failed: {e}", exc_info=True)
+            return {
+                "_query_text": query_text,
+                "_query_payload": query,
+                "raw_result": None,
+                "error": f"CoreRAG query failed: {e}",
+            }
 
     def _query_largerag(self, task: Dict, knowledge_state: Dict) -> Optional[Dict]:
         """
@@ -1685,13 +2874,17 @@ Output ONLY the query text (no JSON, no explanation):"""
             logger.warning("LargeRAG client not available")
             return None
 
+        query_text = ""
+        query = None
         try:
             num_prev_queries = knowledge_state["num_literature_queries"]
 
             # Summarize previous queries to avoid repetition
             prev_lit_summary = ""
             if knowledge_state["literature_knowledge"]:
-                prev_lit_summary = f"\n**Previous literature queries ({num_prev_queries} total):**\n"
+                prev_lit_summary = (
+                    f"\n**Previous literature queries ({num_prev_queries} total):**\n"
+                )
                 prev_lit_summary += f"Already retrieved {num_prev_queries * 10} documents from literature.\n"
                 prev_lit_summary += "Generate a DIFFERENT query to explore new angles (e.g., different keywords, component variations, property focus)."
 
@@ -1701,42 +2894,78 @@ Output ONLY the query text (no JSON, no explanation):"""
 
             query_gen_prompt = f"""You are generating a query for LargeRAG (literature database with 10,000+ papers) to support DES formulation design.
 
-**Task**: {task['description']}
-**Target Material**: {task['target_material']}
-**Temperature**: {task.get('target_temperature', 25)}°C
-**Constraints**: {task.get('constraints', {})}
+**Task**: {task["description"]}
+**Target Material**: {task["target_material"]}
+**Temperature**: {task.get("target_temperature", 25)}°C
+**Constraints**: {task.get("constraints", {})}
 
 **Current Knowledge State**:
 - Literature queries completed: {num_prev_queries}
-- Theory queries completed: {knowledge_state['num_theory_queries']}
+- Theory queries completed: {knowledge_state["num_theory_queries"]}
 {prev_lit_summary}
 {theory_summary}
 
 **Your Goal**: Generate a literature search query to find relevant DES formulations and experimental data.
 
-**Guidelines**:
+            **Guidelines**:
 - Query #{num_prev_queries + 1} of literature search
 - If first query: Search for direct DES formulation examples
 - If subsequent query: Explore DIFFERENT angles (e.g., component variations, property data, dissolution mechanisms, alternative formulations)
-- **IMPORTANT**: Make each query DIFFERENT from previous ones to maximize information coverage
-- Use specific keywords relevant to DES and {task['target_material']}
+            - **IMPORTANT**: Make each query DIFFERENT from previous ones to maximize information coverage
+            - Use specific keywords relevant to DES and {task["target_material"]}
+            - Output MUST be a NON-EMPTY query string. If unsure, output a broad DES + target_material query.
 
 Output ONLY the query text (no JSON, no explanation):"""
 
             query_text = self.llm_client(query_gen_prompt).strip()
             # Remove quotes if LLM added them
             query_text = query_text.strip('"').strip("'")
+            query_text = query_text.replace("```", " ")
+            query_text = re.sub(r"\s+", " ", query_text).strip()
 
-            logger.info(f"[LargeRAG Query #{num_prev_queries + 1}] LLM generated: {query_text[:100]}...")
+            # Guardrail: never send empty/degenerate queries to LargeRAG.
+            if not query_text or query_text.lower() in ("none", "null", "n/a"):
+                target = str(task.get("target_material") or "").strip()
+                temp = normalize_temperature_C(task.get("target_temperature"))
+                temp = 25.0 if temp is None else temp
+                # Deterministic fallback: broad but task-anchored.
+                query_text = (
+                    f'deep eutectic solvent DES "{target}" dissolution leaching solubility {temp}C'
+                    if target
+                    else f"deep eutectic solvent DES dissolution leaching solubility {temp}C"
+                )
+                query_text = re.sub(r"\s+", " ", query_text).strip()
+                logger.warning(
+                    "[LargeRAG Query #%s] Empty query generated by LLM; using fallback query: %s",
+                    num_prev_queries + 1,
+                    query_text[:120],
+                )
 
-            # Format query for LargeRAG
+            logger.info(
+                f"[LargeRAG Query #{num_prev_queries + 1}] LLM generated: {query_text[:100]}..."
+            )
+
+            # Format query for LargeRAG.
+            # NOTE: Do NOT default material_type to "polymer"; that mislabels non-polymer tasks
+            # (e.g., battery cathodes) and can confuse downstream analysis.
+            filters = {
+                "temperature_range": [
+                    (normalize_temperature_C(task.get("target_temperature")) or 25.0)
+                    - 10,
+                    (normalize_temperature_C(task.get("target_temperature")) or 25.0)
+                    + 10,
+                ]
+            }
+            material_category = task.get("material_category")
+            if material_category:
+                filters["material_type"] = material_category
+
             query = {
                 "query": query_text,
-                "filters": {
-                    "material_type": task.get("material_category", "polymer"),
-                    "temperature_range": [task.get("target_temperature", 25) - 10, task.get("target_temperature", 25) + 10]
-                },
-                "top_k": self.config.get("tools", {}).get("largerag", {}).get("max_results", 10)
+                "filters": filters,
+                "top_k": self.config.get("tools", {})
+                .get("largerag", {})
+                .get("max_results", 10),
             }
 
             # Call LargeRAG
@@ -1749,15 +2978,23 @@ Output ONLY the query text (no JSON, no explanation):"""
                 result.setdefault("_query_payload", query)
                 return result
 
+            # Failure path: return a trace object (recorded in trajectory tool_calls),
+            # but it will NOT be treated as a successful retrieval by _act().
             return {
                 "_query_text": query_text,
                 "_query_payload": query,
                 "raw_result": result,
+                "error": "LargeRAG returned no result",
             }
 
         except Exception as e:
-            logger.error(f"LargeRAG query failed: {e}")
-            return None
+            logger.error(f"LargeRAG query failed: {e}", exc_info=True)
+            return {
+                "_query_text": query_text,
+                "_query_payload": query,
+                "raw_result": None,
+                "error": f"LargeRAG query failed: {e}",
+            }
 
     def _generate_formulation(
         self,
@@ -1804,7 +3041,9 @@ Output ONLY the query text (no JSON, no explanation):"""
         response_format = None
         if getattr(self.llm_client, "provider", None) == "openai":
             tool_spec = self._build_formulation_tool_spec(expected_num_components)
-            response_format = self._build_formulation_response_format(expected_num_components)
+            response_format = self._build_formulation_response_format(
+                expected_num_components
+            )
             if tool_spec is not None:
                 logger.info(
                     "[Formulation] Using OpenAI function calling strict for structured output "
@@ -1841,7 +3080,9 @@ Output ONLY the query text (no JSON, no explanation):"""
             "raw_tool_calls": [],
         }
 
-        def _parse_tool_call_json(tool_calls: Any, fn_name: str) -> Optional[Dict[str, Any]]:
+        def _parse_tool_call_json(
+            tool_calls: Any, fn_name: str
+        ) -> Optional[Dict[str, Any]]:
             """
             Extract JSON object from tool call arguments for the expected function.
 
@@ -1987,7 +3228,10 @@ Output ONLY the query text (no JSON, no explanation):"""
                 cand["confidence"] = max(0.0, min(1.0, float(cand["confidence"])))
 
             # Validate reasoning (research-grade: don't allow empty)
-            if not isinstance(cand.get("reasoning"), str) or not cand["reasoning"].strip():
+            if (
+                not isinstance(cand.get("reasoning"), str)
+                or not cand["reasoning"].strip()
+            ):
                 fatal_errors.append("missing/empty reasoning")
                 cand["reasoning"] = str(cand.get("reasoning") or "").strip()
 
@@ -2014,10 +3258,14 @@ Output ONLY the query text (no JSON, no explanation):"""
 
             # Normalize baseline fields (acceptance gating happens later).
             try:
-                cand["baseline_reference"] = str(cand.get("baseline_reference") or "none").strip() or "none"
+                cand["baseline_reference"] = (
+                    str(cand.get("baseline_reference") or "none").strip() or "none"
+                )
             except Exception:
                 cand["baseline_reference"] = "none"
-                notes.append("baseline_reference must be a string (normalized to 'none')")
+                notes.append(
+                    "baseline_reference must be a string (normalized to 'none')"
+                )
 
             delta_raw = cand.get("delta_to_baseline")
             if delta_raw is None:
@@ -2042,11 +3290,17 @@ Output ONLY the query text (no JSON, no explanation):"""
                 if not str(d.get("change") or "").strip():
                     fatal_errors.append(f"delta_to_baseline[{i}].change missing/empty")
                 if not str(d.get("rationale") or "").strip():
-                    fatal_errors.append(f"delta_to_baseline[{i}].rationale missing/empty")
+                    fatal_errors.append(
+                        f"delta_to_baseline[{i}].rationale missing/empty"
+                    )
 
             return {"candidate": cand, "fatal_errors": fatal_errors, "notes": notes}
 
-        primary_strategy = "tool_call" if tool_spec is not None else ("response_format" if response_format is not None else "text")
+        primary_strategy = (
+            "tool_call"
+            if tool_spec is not None
+            else ("response_format" if response_format is not None else "text")
+        )
 
         # ===== P0: Two-stage formulation generation =====
         #
@@ -2065,7 +3319,8 @@ Output ONLY the query text (no JSON, no explanation):"""
                     "IMPORTANT:\n"
                     "- Do NOT output JSON.\n"
                     "- Keep it compact, but research-grade.\n"
-                    "- Include exactly the fields listed below.\n\n"
+                    "- Include exactly the fields listed below.\n"
+                    "- The candidate MUST comply with the Non-Duplication & Diversity Constraints (avoid repeats and overly similar formulations; diversify components + molar ratio).\n\n"
                     "Required fields:\n"
                     "- HBD: component name\n"
                     "- HBA: component name\n"
@@ -2096,7 +3351,8 @@ Output ONLY the query text (no JSON, no explanation):"""
                     "IMPORTANT:\n"
                     "- Do NOT output JSON.\n"
                     "- Keep it compact, but research-grade.\n"
-                    "- Include exactly the fields listed below.\n\n"
+                    "- Include exactly the fields listed below.\n"
+                    "- The candidate MUST comply with the Non-Duplication & Diversity Constraints (avoid repeats and overly similar formulations; diversify components + molar ratio).\n\n"
                     "Required fields:\n"
                     f"- components: exactly {expected_num_components} items; each item has name / role / function\n"
                     "- molar_ratio: use ':' separators and match the component order\n"
@@ -2124,7 +3380,9 @@ Output ONLY the query text (no JSON, no explanation):"""
 
             draft_output = self.llm_client(
                 draft_prompt,
-                max_tokens=int(self.config.get("agent", {}).get("draft_max_tokens", 1400)),
+                max_tokens=int(
+                    self.config.get("agent", {}).get("draft_max_tokens", 1400)
+                ),
             )
             draft_output = draft_output or ""
             diagnostics["draft_used"] = bool(draft_output.strip())
@@ -2205,7 +3463,9 @@ Output ONLY the query text (no JSON, no explanation):"""
         if cand is None or fatal_errors:
             # If tool calling did not produce any structured output (e.g. tools unsupported
             # by SDK/proxy), fall back to response_format (if available) using the full prompt.
-            if primary_strategy == "tool_call" and not diagnostics.get("used_tool_call"):
+            if primary_strategy == "tool_call" and not diagnostics.get(
+                "used_tool_call"
+            ):
                 secondary = "response_format" if response_format is not None else "text"
                 attempt2 = _attempt(
                     transcribe_prompt,
@@ -2219,7 +3479,11 @@ Output ONLY the query text (no JSON, no explanation):"""
                 repair_prompt = self._build_formulation_repair_prompt(
                     task=task,
                     expected_num_components=expected_num_components,
-                    previous_output=(diagnostics["raw_outputs"][-1] if diagnostics["raw_outputs"] else ""),
+                    previous_output=(
+                        diagnostics["raw_outputs"][-1]
+                        if diagnostics["raw_outputs"]
+                        else ""
+                    ),
                     errors=(fatal_errors or ["unparseable JSON output"]),
                 )
                 attempt2 = _attempt(
@@ -2268,7 +3532,9 @@ Output ONLY the query text (no JSON, no explanation):"""
                 baselines=(baselines or []),
                 schema_valid=bool(diagnostics.get("validation_ok")),
                 baseline_min_percent=float(acc_cfg.get("baseline_min_percent", 80.0)),
-                temperature_tolerance_C=float(acc_cfg.get("temperature_tolerance_C", 0.5)),
+                temperature_tolerance_C=float(
+                    acc_cfg.get("temperature_tolerance_C", 0.5)
+                ),
                 require_delta_when_baseline_exists=bool(
                     acc_cfg.get("require_delta_when_baseline_exists", True)
                 ),
@@ -2286,7 +3552,63 @@ Output ONLY the query text (no JSON, no explanation):"""
                 "matched_baseline_id": acc.matched_baseline_id,
             }
         except Exception as e:
-            logger.warning("[Acceptance] Failed to evaluate candidate acceptance: %s", str(e))
+            logger.warning(
+                "[Acceptance] Failed to evaluate candidate acceptance: %s", str(e)
+            )
+
+        # P2.3: Similarity gate (hard reject near-duplicates to history/prior candidates).
+        try:
+            sim = self._similarity_gate_check(
+                (cand or {}).get("formulation") if isinstance(cand, dict) else None,
+                task=task,
+                expected_num_components=expected_num_components,
+                prior_candidates=(prior_candidates or []),
+            )
+            cand["_similarity_gate"] = sim
+
+            if not bool(sim.get("passed")):
+                # Ensure _acceptance exists so downstream selection logic can treat this as rejected.
+                accd = cand.get("_acceptance")
+                if not isinstance(accd, dict):
+                    accd = {
+                        "accepted": True,
+                        "recommendation_class": "RECOMMENDATION",
+                        "baseline_reference": str(
+                            cand.get("baseline_reference") or "none"
+                        ),
+                        "delta_to_baseline": cand.get("delta_to_baseline")
+                        if isinstance(cand.get("delta_to_baseline"), list)
+                        else [],
+                        "reasons": [],
+                        "candidate_signature": compute_formulation_signature(
+                            cand.get("formulation"), expected_num_components
+                        ),
+                        "matched_baseline_id": None,
+                    }
+                    cand["_acceptance"] = accd
+
+                # Override acceptance.
+                reasons = (
+                    accd.get("reasons") if isinstance(accd.get("reasons"), list) else []
+                )
+                merged: List[str] = [str(r) for r in (reasons or []) if r is not None]
+                for r in sim.get("reasons") or []:
+                    r = str(r)
+                    if r and r not in merged:
+                        merged.append(r)
+                accd["reasons"] = merged
+                accd["accepted"] = False
+                accd["similarity_gate"] = {
+                    "passed": False,
+                    "reasons": sim.get("reasons") or [],
+                    "conflicts": sim.get("conflicts") or [],
+                    "min_component_changes": sim.get("min_component_changes"),
+                    "max_overlap": sim.get("max_overlap"),
+                }
+        except Exception as e:
+            logger.warning(
+                "[SimilarityGate] Failed to evaluate similarity gate: %s", str(e)
+            )
 
         return cand
 
@@ -2324,7 +3646,10 @@ Output ONLY the query text (no JSON, no explanation):"""
                     },
                     "reasoning": {"type": "string"},
                     "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                    "supporting_evidence": {"type": "array", "items": {"type": "string"}},
+                    "supporting_evidence": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
                     "baseline_reference": {"type": "string"},
                     "delta_to_baseline": {"type": "array", "items": delta_item},
                 },
@@ -2417,7 +3742,9 @@ Output ONLY the query text (no JSON, no explanation):"""
         tool_choice = {"type": "function", "function": {"name": fn_name}}
         return tools, tool_choice, fn_name
 
-    def _build_formulation_response_format(self, expected_num_components: int) -> Optional[Dict[str, Any]]:
+    def _build_formulation_response_format(
+        self, expected_num_components: int
+    ) -> Optional[Dict[str, Any]]:
         """
         Build OpenAI Chat Completions `response_format` for structured outputs.
 
@@ -2552,9 +3879,9 @@ Output ONLY the query text (no JSON, no explanation):"""
         return f"""You previously generated an answer for a DES formulation task, but it did not meet the required JSON schema.
 
 Task:
-- description: {task.get('description')}
-- target_material: {task.get('target_material')}
-- target_temperature_C: {task.get('target_temperature', 25)}
+- description: {task.get("description")}
+- target_material: {task.get("target_material")}
+- target_temperature_C: {task.get("target_temperature", 25)}
 - num_components: {expected_num_components}
 
 Errors detected:
@@ -2628,7 +3955,11 @@ Your previous output:
                     if b.max_efficiency_value is not None
                     else "N/A"
                 )
-                t = f"{b.target_temperature_C} °C" if b.target_temperature_C is not None else "N/A"
+                t = (
+                    f"{b.target_temperature_C} °C"
+                    if b.target_temperature_C is not None
+                    else "N/A"
+                )
                 summary = b.formulation_summary or "<unavailable summary>"
                 prompt += f"- {b.baseline_id}: {summary} | max_leaching_efficiency≈{eff} | T≈{t}\n"
             prompt += "\n"
@@ -2662,8 +3993,20 @@ Your previous output:
             for i, literature in enumerate(literature_list, 1):
                 prompt += f"### Literature Query {i}\n{self._format_largerag_for_prompt(literature)}\n\n"
 
+        # Prompt-time dedup: inject recent historical formulations close to generation time.
+        non_dup = self._build_non_duplication_block_for_prompt(
+            task=task,
+            expected_num_components=expected_num_components,
+            prior_candidates=prior_candidates,
+            baselines=baselines,
+        )
+        if non_dup:
+            prompt += non_dup
+
         # Instructions - Support both binary and multi-component DES
-        num_components = task.get("num_components", 2)  # Default to binary (2-component) DES
+        num_components = task.get(
+            "num_components", 2
+        )  # Default to binary (2-component) DES
 
         if num_components == 2:
             # Binary DES (traditional format)
@@ -2743,7 +4086,6 @@ Format your response as JSON:
 - **Literature precedent**: Check if similar multi-component systems have been reported
 """
 
-
         return prompt
 
     def _format_acceptance_feedback_for_prompt(
@@ -2786,7 +4128,9 @@ Format your response as JSON:
 
             idx = base_index + offset
             try:
-                f_norm = normalize_formulation(cand.get("formulation"), expected_num_components)
+                f_norm = normalize_formulation(
+                    cand.get("formulation"), expected_num_components
+                )
             except Exception:
                 f_norm = cand.get("formulation")
 
@@ -2799,8 +4143,14 @@ Format your response as JSON:
                 {
                     "index": idx,
                     "accepted": bool(acc.get("accepted")),
-                    "recommendation_class": str(acc.get("recommendation_class") or "N/A"),
-                    "baseline_reference": str(acc.get("baseline_reference") or cand.get("baseline_reference") or "none"),
+                    "recommendation_class": str(
+                        acc.get("recommendation_class") or "N/A"
+                    ),
+                    "baseline_reference": str(
+                        acc.get("baseline_reference")
+                        or cand.get("baseline_reference")
+                        or "none"
+                    ),
                     "matched_baseline_id": acc.get("matched_baseline_id"),
                     "candidate_signature": acc.get("candidate_signature"),
                     "summary": summary,
@@ -2835,7 +4185,9 @@ Format your response as JSON:
 
         baseline_lines: List[str] = []
         if under_ids_unique and baselines:
-            by_id = {b.baseline_id: b for b in baselines if getattr(b, "baseline_id", None)}
+            by_id = {
+                b.baseline_id: b for b in baselines if getattr(b, "baseline_id", None)
+            }
             for bid in under_ids_unique[:3]:
                 b = by_id.get(bid)
                 if b is None:
@@ -2845,7 +4197,9 @@ Format your response as JSON:
                     if b.max_efficiency_value is not None
                     else "N/A"
                 )
-                baseline_lines.append(f"- {b.baseline_id}: {b.formulation_summary} | max_leaching_efficiency≈{eff}")
+                baseline_lines.append(
+                    f"- {b.baseline_id}: {b.formulation_summary} | max_leaching_efficiency≈{eff}"
+                )
 
         # Build the section.
         lines: List[str] = []
@@ -2877,7 +4231,9 @@ Format your response as JSON:
                 "or molar ratio (re-ordering or renaming does NOT count)."
             )
             if baseline_lines:
-                lines.append("- Underperforming baselines implicated in recent failures:")
+                lines.append(
+                    "- Underperforming baselines implicated in recent failures:"
+                )
                 lines.extend(baseline_lines)
 
         if "missing_delta_to_baseline" in reason_set:
@@ -2889,6 +4245,39 @@ Format your response as JSON:
         if "schema_invalid" in reason_set:
             lines.append(
                 "- Output must strictly match the required JSON schema (fixed component count + required fields)."
+            )
+
+        if any(str(r).startswith("too_similar_history") for r in reason_set):
+            # Similarity gate is stricter than baseline repeat: it blocks near-duplicates.
+            sim_cfg = (self.config.get("agent", {}) or {}).get(
+                "similarity_gate", {}
+            ) or {}
+            min_changes = int(sim_cfg.get("min_component_changes", 1))
+            min_changes = max(
+                1, min(min_changes, max(1, int(expected_num_components or 0)))
+            )
+            lines.append(
+                "- Similarity gate rejected a near-duplicate. Your next candidate MUST be substantially different from recent recommendations "
+                "(do NOT keep the same component set and only tweak ratios/water)."
+            )
+            lines.append(
+                f"- Change at least {min_changes} component identity relative to recent history. Reusing a familiar molar_ratio bucket is acceptable if the component set is no longer the same."
+            )
+            lines.append(
+                "- Seek a different dissolution/leaching mechanism class (e.g., Lewis-acidic metal-chloride DES / chlorometallate, stronger halide complexation, "
+                "different chelation chemistry), and make that explicit in the reasoning."
+            )
+            lines.append(
+                "- IMPORTANT: When direct precedent is insufficient, you are allowed to make a bold but chemically grounded exploratory hypothesis using your parametric knowledge."
+            )
+            lines.append(
+                "- The goal of this round is not only local performance optimization, but also informative exploration. A candidate that may underperform now can still be valuable if it opens a new mechanistic path and produces new experimental lessons."
+            )
+            lines.append(
+                "- Therefore, do NOT retreat to another conservative near-variant of a previously rejected family. Instead, propose a testable candidate that creates a new search branch with clear mechanistic intent."
+            )
+            lines.append(
+                "- Your reasoning MUST explain: (1) the hypothesized mechanism, (2) why this candidate is not just a local tweak of the rejected family, and (3) what new information the experiment would teach us even if the result is negative."
             )
 
         lines.append("")  # trailing newline
@@ -2965,7 +4354,9 @@ Format your response as JSON:
         if not isinstance(literature, dict):
             return str(literature)
 
-        query_text = (literature.get("_query_text") or literature.get("query") or "").strip()
+        query_text = (
+            literature.get("_query_text") or literature.get("query") or ""
+        ).strip()
         formatted_text = literature.get("formatted_text")
         if isinstance(formatted_text, str) and formatted_text.strip():
             if query_text:
@@ -3025,7 +4416,7 @@ Format your response as JSON:
         import re
 
         # Try to extract JSON
-        json_match = re.search(r'```json\s*(.*?)\s*```', llm_output, re.DOTALL)
+        json_match = re.search(r"```json\s*(.*?)\s*```", llm_output, re.DOTALL)
         if json_match:
             try:
                 result = json.loads(json_match.group(1))
@@ -3038,15 +4429,13 @@ Format your response as JSON:
             "formulation": {},
             "reasoning": llm_output[:500],
             "confidence": 0.5,
-            "supporting_evidence": []
+            "supporting_evidence": [],
         }
 
     # ===== NEW: Asynchronous Experimental Feedback Methods =====
 
     def submit_experiment_feedback(
-        self,
-        recommendation_id: str,
-        experiment_result: ExperimentResult
+        self, recommendation_id: str, experiment_result: ExperimentResult
     ) -> Dict:
         """
         Submit experimental feedback for a recommendation (NEW: Async feedback loop).
@@ -3076,15 +4465,18 @@ Format your response as JSON:
                 - Call submit_experiment_feedback(rec_id, experiment_result)
                 - Inspect returned measurement_count / memories_extracted
         """
-        logger.info(f"Processing experimental feedback for recommendation {recommendation_id}")
+        logger.info(
+            f"Processing experimental feedback for recommendation {recommendation_id}"
+        )
 
         try:
             # Check if this is an update (recommendation already has feedback)
             existing_rec = self.rec_manager.get_recommendation(recommendation_id)
             is_update = (
-                existing_rec is not None and
-                existing_rec.experiment_result is not None and
-                existing_rec.trajectory.metadata.get("feedback_processed_at") is not None
+                existing_rec is not None
+                and existing_rec.experiment_result is not None
+                and existing_rec.trajectory.metadata.get("feedback_processed_at")
+                is not None
             )
 
             if is_update:
@@ -3095,12 +4487,13 @@ Format your response as JSON:
 
             # Step 2: Use FeedbackProcessor to extract memories and update ReasoningBank
             process_result = self.feedback_processor.process_feedback(
-                recommendation_id,
-                is_update=is_update
+                recommendation_id, is_update=is_update
             )
 
             # Log using measurement count
-            solubility_str = f"measurements={process_result.get('measurement_count', 0)}"
+            solubility_str = (
+                f"measurements={process_result.get('measurement_count', 0)}"
+            )
             logger.info(
                 f"Feedback processing completed: {process_result['num_memories']} "
                 f"memories extracted ({solubility_str})"
@@ -3128,8 +4521,10 @@ Format your response as JSON:
                 "memories_extracted": process_result["memories_extracted"],
                 "measurement_count": process_result.get("measurement_count", 0),
                 "is_update": is_update,
-                "deleted_memories": process_result.get("deleted_memories", 0) if is_update else None,
-                "message": message
+                "deleted_memories": process_result.get("deleted_memories", 0)
+                if is_update
+                else None,
+                "message": message,
             }
 
         except Exception as e:
@@ -3137,13 +4532,11 @@ Format your response as JSON:
             return {
                 "status": "error",
                 "recommendation_id": recommendation_id,
-                "message": f"Error processing feedback: {str(e)}"
+                "message": f"Error processing feedback: {str(e)}",
             }
 
     def load_historical_recommendations(
-        self,
-        data_path: str,
-        reprocess: bool = True
+        self, data_path: str, reprocess: bool = True
     ) -> Dict:
         """
         Load historical recommendations from another system instance (NEW: Cross-instance reuse).
@@ -3207,11 +4600,12 @@ Format your response as JSON:
 
                         if reprocess:
                             # Re-extract memories with current extraction logic
-                            logger.info(f"Reprocessing {rec.recommendation_id} with current logic")
+                            logger.info(
+                                f"Reprocessing {rec.recommendation_id} with current logic"
+                            )
 
                             new_memories = self.extractor.extract_from_experiment(
-                                rec.trajectory,
-                                rec.experiment_result
+                                rec.trajectory, rec.experiment_result
                             )
 
                             if new_memories:
@@ -3223,7 +4617,9 @@ Format your response as JSON:
                                 )
                         else:
                             # Just load existing memories (if stored in trajectory metadata)
-                            existing_memories = rec.trajectory.metadata.get("extracted_memories", [])
+                            existing_memories = rec.trajectory.metadata.get(
+                                "extracted_memories", []
+                            )
                             total_memories += len(existing_memories)
                             logger.info(
                                 f"Loaded {len(existing_memories)} existing memories from {rec.recommendation_id}"
@@ -3259,7 +4655,7 @@ Format your response as JSON:
                     f"Successfully loaded {num_loaded} recommendations. "
                     f"Reprocessed {num_reprocessed} with current logic. "
                     f"Added {total_memories} memories to ReasoningBank."
-                )
+                ),
             }
 
         except Exception as e:
@@ -3269,7 +4665,7 @@ Format your response as JSON:
                 "num_loaded": 0,
                 "num_reprocessed": 0,
                 "memories_added": 0,
-                "message": f"Error loading historical data: {str(e)}"
+                "message": f"Error loading historical data: {str(e)}",
             }
 
 
