@@ -7,6 +7,14 @@ uvicorn[standard]==0.27.0
 # CORS and middleware
 python-multipart==0.0.6
 
+# LLM client runtime dependencies
+# Pin a tested OpenAI/Langfuse pair to keep Docker builds reproducible and
+# avoid expensive resolver backtracking across the whole OpenAI 1.x range.
+# The chosen OpenAI version must satisfy both:
+# - langchain-openai==0.2.14  -> openai>=1.58.1,<2.0.0
+# - dspy==2.6.14              -> openai>=0.28.1,<=1.61.0
+openai==1.61.0
+langfuse==3.7.0
 
 # Note: DESAgent dependencies are already in src/agent
 # This file only includes Web API specific dependencies

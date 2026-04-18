@@ -11,12 +11,43 @@ import os
 import logging
 import re
 import threading
-from typing import Optional, Dict, Any, Iterable
-from openai import OpenAI
+from importlib import import_module
+from typing import Optional, Dict, Any, Iterable, Type
 
 from .serialization import to_jsonable
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Parse a boolean environment variable."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _load_openai_class() -> Type[Any]:
+    """Load the standard OpenAI client class lazily."""
+    try:
+        return getattr(import_module("openai"), "OpenAI")
+    except Exception as e:  # pragma: no cover - exercised in real envs
+        raise ImportError(
+            "The 'openai' package is required by LLMClient. "
+            "Install it with `pip install openai`."
+        ) from e
+
+
+def _load_langfuse_openai_class() -> Type[Any]:
+    """Load Langfuse's instrumented OpenAI client class lazily."""
+    try:
+        module = import_module("langfuse.openai")
+        return getattr(module, "OpenAI")
+    except Exception as e:  # pragma: no cover - exercised in real envs
+        raise ImportError(
+            "Langfuse OpenAI integration is unavailable. "
+            "Install it with `pip install langfuse`."
+        ) from e
 
 
 class LLMClient:
@@ -66,6 +97,7 @@ class LLMClient:
         self.reasoning_effort = reasoning_effort
         # OpenAI-only verbosity control (low/medium/high). Safe to omit.
         self.verbosity = verbosity
+        self.langfuse_enabled = False
 
         # Determine API key and base URL
         if provider == "openai":
@@ -90,10 +122,7 @@ class LLMClient:
             )
 
         # Initialize OpenAI client
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url
-        )
+        self.client = self._create_openai_compatible_client()
 
         # Some OpenAI SDK versions (and some OpenAI-compatible vendors) do not
         # accept newer kwargs (e.g., verbosity) in chat.completions.create.
@@ -104,8 +133,59 @@ class LLMClient:
 
         logger.info(
             f"Initialized LLM client: provider={provider}, model={model}, "
-            f"temperature={temperature}, base_url={self.base_url}"
+            f"temperature={temperature}, base_url={self.base_url}, "
+            f"langfuse_enabled={self.langfuse_enabled}"
         )
+
+    @staticmethod
+    def _has_langfuse_credentials() -> bool:
+        """Return True when the minimum Langfuse credentials are configured."""
+        public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
+        secret_key = os.getenv("LANGFUSE_SECRET_KEY")
+        return bool(public_key and secret_key)
+
+    def _create_openai_compatible_client(self) -> Any:
+        """
+        Create an OpenAI-compatible client.
+
+        If Langfuse is explicitly enabled and configured, use Langfuse's
+        instrumented OpenAI wrapper. Otherwise, fall back to the plain OpenAI
+        client to preserve current behavior.
+        """
+        client_kwargs = {
+            "api_key": self.api_key,
+            "base_url": self.base_url,
+        }
+
+        langfuse_requested = _env_flag("LANGFUSE_ENABLED", default=False)
+        if langfuse_requested and self._has_langfuse_credentials():
+            try:
+                client_cls = _load_langfuse_openai_class()
+                self.langfuse_enabled = True
+                logger.info(
+                    "Using Langfuse-instrumented OpenAI client "
+                    "(provider=%s, model=%s).",
+                    self.provider,
+                    self.model,
+                )
+                return client_cls(**client_kwargs)
+            except Exception as e:
+                logger.warning(
+                    "Failed to initialize Langfuse OpenAI client; falling back to plain OpenAI client. "
+                    "provider=%s model=%s error=%s",
+                    self.provider,
+                    self.model,
+                    e,
+                )
+        elif langfuse_requested:
+            logger.warning(
+                "LANGFUSE_ENABLED is set, but LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY "
+                "are missing. Falling back to plain OpenAI client."
+            )
+
+        client_cls = _load_openai_class()
+        self.langfuse_enabled = False
+        return client_cls(**client_kwargs)
 
     @staticmethod
     def _is_reasoning_enabled(reasoning_effort: Optional[str]) -> bool:
