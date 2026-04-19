@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 import pytest
+from pytest import MonkeyPatch
 
 import sys
 from pathlib import Path
@@ -50,6 +51,63 @@ class _DummyChat:
 class _DummyOpenAI:
     def __init__(self):
         self.chat = _DummyChat()
+
+
+def test_langfuse_requested_without_credentials_falls_back(monkeypatch: MonkeyPatch):
+    from agent.utils.llm_client import LLMClient
+
+    monkeypatch.setenv("LANGFUSE_ENABLED", "true")
+    monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
+    monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.chat = _DummyChat()
+
+    monkeypatch.setattr("agent.utils.llm_client._load_openai_class", lambda: _FakeOpenAI)
+
+    llm = LLMClient(
+        provider="openai",
+        model="gpt-5.2",
+        api_key="sk-test",
+        base_url="https://api.openai.com/v1",
+    )
+
+    assert llm.langfuse_enabled is False
+    assert isinstance(llm.client, _FakeOpenAI)
+    assert llm.client.kwargs["api_key"] == "sk-test"
+    assert llm.client.kwargs["base_url"] == "https://api.openai.com/v1"
+
+
+def test_langfuse_requested_with_credentials_uses_langfuse_client(monkeypatch: MonkeyPatch):
+    from agent.utils.llm_client import LLMClient
+
+    monkeypatch.setenv("LANGFUSE_ENABLED", "true")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-test")
+
+    class _FakeLangfuseOpenAI:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.chat = _DummyChat()
+
+    monkeypatch.setattr(
+        "agent.utils.llm_client._load_langfuse_openai_class",
+        lambda: _FakeLangfuseOpenAI,
+    )
+
+    llm = LLMClient(
+        provider="dashscope",
+        model="qwen-plus",
+        api_key="dash-test",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+    )
+
+    assert llm.langfuse_enabled is True
+    assert isinstance(llm.client, _FakeLangfuseOpenAI)
+    assert llm.client.kwargs["api_key"] == "dash-test"
+    assert llm.client.kwargs["base_url"] == "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 
 def test_openai_reasoning_effort_drops_temperature():

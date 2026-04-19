@@ -8,6 +8,9 @@ RUN apt-get update && apt-get install -y \
     curl \
     gcc \
     g++ \
+    build-essential \
+    gfortran \
+    pkg-config \
     tzdata \
     && rm -rf /var/lib/apt/lists/*
 
