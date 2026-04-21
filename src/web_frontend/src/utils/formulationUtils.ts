@@ -10,17 +10,17 @@ import type { FormulationData } from '../types/formulation';
 export function getFormulationDisplayString(formulation: FormulationData): string {
   // Binary formulation
   if (formulation.HBD && formulation.HBA) {
-    return `${formulation.HBD} : ${formulation.HBA} (${formulation.molar_ratio})`;
+    return `${formulation.HBD} : ${formulation.HBA} (${formulation.molar_ratio.replace(/:/g, ' : ')})`;
   }
 
   // Multi-component formulation
   if (formulation.components && formulation.components.length > 0) {
     const componentNames = formulation.components.map(c => c.name).join(' + ');
-    return `${componentNames} (${formulation.molar_ratio})`;
+    return `${componentNames} (${formulation.molar_ratio.replace(/:/g, ' : ')})`;
   }
 
   // Unknown formulation
-  return `Unknown formulation (${formulation.molar_ratio})`;
+  return `Unknown formulation (${formulation.molar_ratio.replace(/:/g, ' : ')})`;
 }
 
 /**
