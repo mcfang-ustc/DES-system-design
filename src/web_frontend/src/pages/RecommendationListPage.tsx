@@ -61,7 +61,10 @@ function RecommendationListPage() {
           display: 'inline-flex',
           alignItems: 'center',
           whiteSpace: 'nowrap',
-          fontVariantNumeric: 'tabular-nums',
+          fontFamily: 'inherit',
+          fontSize: 'inherit',
+          fontWeight: 'inherit',
+          lineHeight: 'inherit',
         }}
       >
         {ratioParts.map((part, index) => (
@@ -74,7 +77,7 @@ function RecommendationListPage() {
               <span
                 style={{
                   margin: '0 10px',
-                  color: 'rgba(0, 0, 0, 0.45)',
+                  color: 'inherit',
                 }}
               >
                 :
@@ -88,7 +91,18 @@ function RecommendationListPage() {
 
   const renderFormulationDisplay = (formulation: FormulationData) => {
     const ratioDisplay = (
-      <span style={{ color: 'rgba(0, 0, 0, 0.45)' }}>
+      <span
+        style={{
+          display: 'block',
+          marginTop: 4,
+          color: 'inherit',
+          fontFamily: 'inherit',
+          fontSize: 'inherit',
+          fontWeight: 'inherit',
+          lineHeight: 'inherit',
+          whiteSpace: 'nowrap',
+        }}
+      >
         ({renderMolarRatio(formulation.molar_ratio)})
       </span>
     );
@@ -98,7 +112,8 @@ function RecommendationListPage() {
         <>
           {formulation.HBD}
           <span style={{ margin: '0 6px', color: 'rgba(0, 0, 0, 0.45)' }}>:</span>
-          {formulation.HBA} {ratioDisplay}
+          {formulation.HBA}
+          {ratioDisplay}
         </>
       );
     }
@@ -113,7 +128,7 @@ function RecommendationListPage() {
               )}
               {component.name}
             </span>
-          ))}{' '}
+          ))}
           {ratioDisplay}
         </>
       );
