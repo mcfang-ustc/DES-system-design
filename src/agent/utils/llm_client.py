@@ -9,10 +9,45 @@ Supports:
 
 import os
 import logging
-from typing import Optional, Dict, Any
-from openai import OpenAI
+import re
+import threading
+from importlib import import_module
+from typing import Optional, Dict, Any, Iterable, Type
+
+from .serialization import to_jsonable
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Parse a boolean environment variable."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _load_openai_class() -> Type[Any]:
+    """Load the standard OpenAI client class lazily."""
+    try:
+        return getattr(import_module("openai"), "OpenAI")
+    except Exception as e:  # pragma: no cover - exercised in real envs
+        raise ImportError(
+            "The 'openai' package is required by LLMClient. "
+            "Install it with `pip install openai`."
+        ) from e
+
+
+def _load_langfuse_openai_class() -> Type[Any]:
+    """Load Langfuse's instrumented OpenAI client class lazily."""
+    try:
+        module = import_module("langfuse.openai")
+        return getattr(module, "OpenAI")
+    except Exception as e:  # pragma: no cover - exercised in real envs
+        raise ImportError(
+            "Langfuse OpenAI integration is unavailable. "
+            "Install it with `pip install langfuse`."
+        ) from e
 
 
 class LLMClient:
@@ -37,6 +72,8 @@ class LLMClient:
         model: str = "qwen-plus",
         temperature: float = 0.7,
         max_tokens: int = 2000,
+        reasoning_effort: Optional[str] = None,
+        verbosity: Optional[str] = None,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None
     ):
@@ -55,11 +92,18 @@ class LLMClient:
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        # OpenAI-only (gpt-5.* etc.). If set to non-"none", some sampling params
+        # (temperature/top_p/logprobs) become invalid and must be omitted.
+        self.reasoning_effort = reasoning_effort
+        # OpenAI-only verbosity control (low/medium/high). Safe to omit.
+        self.verbosity = verbosity
+        self.langfuse_enabled = False
 
         # Determine API key and base URL
         if provider == "openai":
             self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-            self.base_url = base_url or "https://api.openai.com/v1"
+            env_base_url = os.getenv("OPENAI_API_BASE") or os.getenv("OPENAI_BASE_URL")
+            self.base_url = base_url or env_base_url or "https://api.openai.com/v1"
 
         elif provider == "dashscope":
             self.api_key = api_key or os.getenv("DASHSCOPE_API_KEY")
@@ -78,15 +122,105 @@ class LLMClient:
             )
 
         # Initialize OpenAI client
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url
-        )
+        self.client = self._create_openai_compatible_client()
+
+        # Some OpenAI SDK versions (and some OpenAI-compatible vendors) do not
+        # accept newer kwargs (e.g., verbosity) in chat.completions.create.
+        # We learn unsupported parameters at runtime and avoid passing them
+        # again to keep the system resilient in production images.
+        self._unsupported_chat_params: set[str] = set()
+        self._unsupported_chat_params_lock = threading.Lock()
 
         logger.info(
             f"Initialized LLM client: provider={provider}, model={model}, "
-            f"temperature={temperature}"
+            f"temperature={temperature}, base_url={self.base_url}, "
+            f"langfuse_enabled={self.langfuse_enabled}"
         )
+
+    @staticmethod
+    def _has_langfuse_credentials() -> bool:
+        """Return True when the minimum Langfuse credentials are configured."""
+        public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
+        secret_key = os.getenv("LANGFUSE_SECRET_KEY")
+        return bool(public_key and secret_key)
+
+    def _create_openai_compatible_client(self) -> Any:
+        """
+        Create an OpenAI-compatible client.
+
+        If Langfuse is explicitly enabled and configured, use Langfuse's
+        instrumented OpenAI wrapper. Otherwise, fall back to the plain OpenAI
+        client to preserve current behavior.
+        """
+        client_kwargs = {
+            "api_key": self.api_key,
+            "base_url": self.base_url,
+        }
+
+        langfuse_requested = _env_flag("LANGFUSE_ENABLED", default=False)
+        if langfuse_requested and self._has_langfuse_credentials():
+            try:
+                client_cls = _load_langfuse_openai_class()
+                self.langfuse_enabled = True
+                logger.info(
+                    "Using Langfuse-instrumented OpenAI client "
+                    "(provider=%s, model=%s).",
+                    self.provider,
+                    self.model,
+                )
+                return client_cls(**client_kwargs)
+            except Exception as e:
+                logger.warning(
+                    "Failed to initialize Langfuse OpenAI client; falling back to plain OpenAI client. "
+                    "provider=%s model=%s error=%s",
+                    self.provider,
+                    self.model,
+                    e,
+                )
+        elif langfuse_requested:
+            logger.warning(
+                "LANGFUSE_ENABLED is set, but LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY "
+                "are missing. Falling back to plain OpenAI client."
+            )
+
+        client_cls = _load_openai_class()
+        self.langfuse_enabled = False
+        return client_cls(**client_kwargs)
+
+    @staticmethod
+    def _is_reasoning_enabled(reasoning_effort: Optional[str]) -> bool:
+        """Return True when reasoning is enabled (i.e., not None/"none")."""
+        if reasoning_effort is None:
+            return False
+        return str(reasoning_effort).strip().lower() != "none"
+
+    @staticmethod
+    def _pop_any(d: Dict[str, Any], keys: Iterable[str]) -> None:
+        """Pop keys from dict if present (in-place)."""
+        for k in keys:
+            d.pop(k, None)
+
+    @staticmethod
+    def _parse_unexpected_kwarg(err: TypeError) -> Optional[str]:
+        """
+        Extract the unexpected kwarg name from typical Python TypeError messages.
+
+        Example:
+            "Completions.create() got an unexpected keyword argument 'verbosity'"
+        """
+        msg = str(err)
+        m = re.search(r"unexpected keyword argument '([^']+)'", msg)
+        if not m:
+            return None
+        return m.group(1)
+
+    def _is_chat_param_unsupported(self, name: str) -> bool:
+        with self._unsupported_chat_params_lock:
+            return name in self._unsupported_chat_params
+
+    def _mark_chat_param_unsupported(self, name: str) -> None:
+        with self._unsupported_chat_params_lock:
+            self._unsupported_chat_params.add(name)
 
     def chat(
         self,
@@ -94,8 +228,15 @@ class LLMClient:
         system_prompt: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
+        verbosity: Optional[str] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        tools: Optional[list] = None,
+        tool_choice: Optional[Any] = None,
+        parallel_tool_calls: Optional[bool] = None,
+        return_tool_calls: bool = False,
         **kwargs
-    ) -> str:
+    ) -> Any:
         """
         Send a chat completion request.
 
@@ -104,10 +245,17 @@ class LLMClient:
             system_prompt: Optional system prompt
             temperature: Override default temperature
             max_tokens: Override default max_tokens
+            reasoning_effort: OpenAI reasoning effort (e.g., "none", "low", "medium", "high")
+            verbosity: OpenAI verbosity (e.g., "low", "medium", "high")
+            tools: OpenAI Chat Completions tools spec (function calling)
+            tool_choice: OpenAI tool_choice (force/auto) for tools
+            parallel_tool_calls: OpenAI parallel_tool_calls flag
+            return_tool_calls: If True, return a dict with tool_calls + content
             **kwargs: Additional parameters for API call
 
         Returns:
-            Generated text response
+            By default: Generated text response (str).
+            If return_tool_calls=True: dict with keys {content, tool_calls, raw_response}.
         """
         # Build messages
         messages = []
@@ -117,26 +265,168 @@ class LLMClient:
 
         messages.append({"role": "user", "content": prompt})
 
-        # Prepare parameters
-        params = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": temperature or self.temperature,
-            "max_tokens": max_tokens or self.max_tokens,
-            **kwargs
+        # Prepare parameters.
+        # NOTE: OpenAI gpt-5.* reasoning mode disallows sampling params such as
+        # temperature/top_p/logprobs unless reasoning_effort="none". We enforce
+        # this at the client layer to avoid hard-to-debug 400s at runtime.
+        effective_reasoning_effort = (
+            reasoning_effort
+            if reasoning_effort is not None
+            else self.reasoning_effort
+        )
+        effective_verbosity = verbosity if verbosity is not None else self.verbosity
+        effective_response_format = response_format
+
+        # Prevent accidental overrides via **kwargs
+        reserved = {
+            "model",
+            "messages",
+            "temperature",
+            "max_tokens",
+            "max_completion_tokens",
+            "reasoning_effort",
+            "verbosity",
+            "response_format",
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
         }
+        if any(k in kwargs for k in reserved):
+            logger.warning(
+                "LLMClient.chat received reserved keys in kwargs and will ignore them: %s",
+                sorted(set(kwargs.keys()) & reserved),
+            )
+            kwargs = {k: v for k, v in kwargs.items() if k not in reserved}
+
+        params: Dict[str, Any] = {"model": self.model, "messages": messages}
+
+        # Reasoning controls (OpenAI-only)
+        if self.provider == "openai":
+            if effective_reasoning_effort is not None:
+                if not self._is_chat_param_unsupported("reasoning_effort"):
+                    params["reasoning_effort"] = effective_reasoning_effort
+            if effective_verbosity is not None:
+                if not self._is_chat_param_unsupported("verbosity"):
+                    params["verbosity"] = effective_verbosity
+            if effective_response_format is not None:
+                if not self._is_chat_param_unsupported("response_format"):
+                    params["response_format"] = effective_response_format
+            if tools is not None:
+                if not self._is_chat_param_unsupported("tools"):
+                    params["tools"] = tools
+            if tool_choice is not None:
+                if not self._is_chat_param_unsupported("tool_choice"):
+                    params["tool_choice"] = tool_choice
+            if parallel_tool_calls is not None:
+                if not self._is_chat_param_unsupported("parallel_tool_calls"):
+                    params["parallel_tool_calls"] = bool(parallel_tool_calls)
+
+        # Token limit mapping (OpenAI: max_completion_tokens; others: max_tokens)
+        effective_max_tokens = self.max_tokens if max_tokens is None else max_tokens
+        if self.provider == "openai":
+            params["max_completion_tokens"] = effective_max_tokens
+        else:
+            params["max_tokens"] = effective_max_tokens
+
+        # Sampling params. For OpenAI + reasoning enabled, do NOT send them.
+        effective_temperature = self.temperature if temperature is None else temperature
+        reasoning_on = (self.provider == "openai") and self._is_reasoning_enabled(effective_reasoning_effort)
+        if reasoning_on:
+            # Drop any incompatible params that might be supplied in kwargs too.
+            self._pop_any(kwargs, ("temperature", "top_p", "logprobs", "top_logprobs"))
+            if temperature is not None:
+                logger.info(
+                    "reasoning_effort=%s is enabled; ignoring temperature override.",
+                    effective_reasoning_effort,
+                )
+        else:
+            params["temperature"] = effective_temperature
+
+        # Merge remaining kwargs last (advanced usage)
+        params.update(kwargs)
 
         # Make API call
-        try:
-            response = self.client.chat.completions.create(**params)
-            content = response.choices[0].message.content
+        request_params: Dict[str, Any] = dict(params)
+        for attempt in range(3):
+            try:
+                response = self.client.chat.completions.create(**request_params)
+                message = response.choices[0].message
+                content = message.content or ""
 
-            logger.debug(f"LLM response: {content[:100]}...")
-            return content
+                logger.debug(f"LLM response: {content[:100]}...")
+                if not return_tool_calls:
+                    return content
 
-        except Exception as e:
-            logger.error(f"LLM API call failed: {e}")
-            raise
+                # Tool calls may be OpenAI SDK objects; convert to JSON-safe structures.
+                tool_calls = getattr(message, "tool_calls", None)
+                return {
+                    "content": content,
+                    "tool_calls": to_jsonable(tool_calls),
+                    "raw_response": None,  # keep interface stable; don't persist SDK objects
+                }
+
+            except TypeError as e:
+                # Compatibility layer for older OpenAI SDK versions that don't
+                # accept certain kwargs (e.g., 'verbosity').
+                bad = self._parse_unexpected_kwarg(e)
+                if bad and bad in request_params:
+                    self._mark_chat_param_unsupported(bad)
+                    request_params.pop(bad, None)
+                    logger.warning(
+                        "OpenAI SDK does not support chat.completions param '%s' "
+                        "(provider=%s, model=%s). Retrying without it. "
+                        "Fix options: upgrade openai SDK in the image, or set the param to null in config.",
+                        bad,
+                        self.provider,
+                        self.model,
+                    )
+                    continue
+                raise
+
+            except Exception as e:
+                # Some SDK versions / proxies reject newer parameters via HTTP 400
+                # (instead of a Python TypeError). Retry once by removing the
+                # offending param so production doesn't hard-fail.
+                msg = str(e)
+                if (
+                    self.provider == "openai"
+                    and "response_format" in request_params
+                    and ("response_format" in msg or "json_schema" in msg or "json_object" in msg)
+                ):
+                    self._mark_chat_param_unsupported("response_format")
+                    request_params.pop("response_format", None)
+                    logger.warning(
+                        "OpenAI API rejected response_format (provider=%s, model=%s). "
+                        "Retrying without it. Error: %s",
+                        self.provider,
+                        self.model,
+                        msg[:300],
+                    )
+                    continue
+
+                if (
+                    self.provider == "openai"
+                    and ("tools" in request_params or "tool_choice" in request_params)
+                    and ("tools" in msg or "tool_choice" in msg or "parallel_tool_calls" in msg)
+                ):
+                    # Some proxies/SDK versions reject tools via HTTP 400.
+                    for k in ("tools", "tool_choice", "parallel_tool_calls"):
+                        if k in request_params:
+                            self._mark_chat_param_unsupported(k)
+                            request_params.pop(k, None)
+                    logger.warning(
+                        "OpenAI API rejected tools/tool_choice (provider=%s, model=%s). "
+                        "Retrying without tool calling. Error: %s",
+                        self.provider,
+                        self.model,
+                        msg[:300],
+                    )
+                    continue
+
+                logger.error(f"LLM API call failed: {e}")
+                raise
+
+        raise RuntimeError("LLM call failed after removing unsupported parameters")
 
     def __call__(self, prompt: str, **kwargs) -> str:
         """
@@ -173,6 +463,8 @@ def create_llm_client_from_config(config: Dict[str, Any]) -> LLMClient:
         model=config.get("model", "qwen-plus"),
         temperature=config.get("temperature", 0.7),
         max_tokens=config.get("max_tokens", 2000),
+        reasoning_effort=config.get("reasoning_effort"),
+        verbosity=config.get("verbosity"),
         api_key=config.get("api_key"),
         base_url=config.get("base_url")
     )

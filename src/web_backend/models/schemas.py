@@ -175,9 +175,40 @@ class TrajectoryStep(BaseModel):
     """Single step in trajectory"""
     action: str
     reasoning: str
+    phase: Optional[str] = Field(
+        None,
+        description="ReAct phase for this step (think/act/observe)",
+        json_schema_extra={"example": "think"},
+    )
+    iteration: Optional[int] = Field(
+        None,
+        ge=1,
+        description="ReAct iteration number (1-based)",
+        json_schema_extra={"example": 1},
+    )
     tool: Optional[str] = None
     num_memories: Optional[int] = None
     formulation: Optional[FormulationData] = None
+    result_summary: Optional[str] = Field(
+        None,
+        description="ACT phase summary (what happened / what was returned)",
+    )
+    observation: Optional[str] = Field(
+        None,
+        description="OBSERVE phase summary (what the agent learned)",
+    )
+    knowledge_updated: Optional[List[Any]] = Field(
+        None,
+        description="Optional list describing what knowledge state fields changed",
+    )
+    key_insights: Optional[List[Any]] = Field(
+        None,
+        description="Optional list of key insights extracted during observe",
+    )
+    information_gaps: Optional[List[Any]] = Field(
+        None,
+        description="Optional list of remaining information gaps",
+    )
 
 
 class Trajectory(BaseModel):

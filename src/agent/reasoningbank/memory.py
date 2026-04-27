@@ -10,6 +10,8 @@ from typing import Optional, List
 from datetime import datetime
 import json
 
+from ..utils.serialization import to_jsonable
+
 
 @dataclass
 class MemoryItem:
@@ -58,8 +60,8 @@ class MemoryItem:
             "source_task_id": self.source_task_id,
             "is_from_success": self.is_from_success,
             "created_at": self.created_at,
-            "embedding": self.embedding,
-            "metadata": self.metadata,
+            "embedding": to_jsonable(self.embedding),
+            "metadata": to_jsonable(self.metadata),
         }
 
     @classmethod
@@ -144,8 +146,15 @@ class Trajectory:
     metadata: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        """Convert trajectory to dictionary"""
-        return asdict(self)
+        """Convert trajectory to a JSON-safe dictionary (no deepcopy)."""
+        return {
+            "task_id": self.task_id,
+            "task_description": self.task_description,
+            "steps": to_jsonable(self.steps),
+            "outcome": self.outcome,
+            "final_result": to_jsonable(self.final_result),
+            "metadata": to_jsonable(self.metadata),
+        }
 
     @classmethod
     def from_dict(cls, data: dict) -> "Trajectory":

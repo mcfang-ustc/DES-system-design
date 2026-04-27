@@ -65,7 +65,9 @@ class AgentLoader:
         try:
             # Load configurations
             web_config = get_web_config()
-            agent_config = get_config()
+            agent_config_path = str(web_config.get_agent_config_path())
+            agent_config = get_config(agent_config_path)
+            logger.info(f"Using agent config: {agent_config.config_path}")
 
             # Create LLM clients from agent config
             llm_config = agent_config.get_llm_config("llm")
@@ -76,6 +78,8 @@ class AgentLoader:
                 model=llm_config["model"],
                 temperature=llm_config["temperature"],
                 max_tokens=llm_config["max_tokens"],
+                reasoning_effort=llm_config.get("reasoning_effort"),
+                verbosity=llm_config.get("verbosity"),
                 base_url=llm_config.get("api_base")
             )
 
@@ -84,6 +88,8 @@ class AgentLoader:
                 model=agent_llm_config["model"],
                 temperature=agent_llm_config["temperature"],
                 max_tokens=agent_llm_config["max_tokens"],
+                reasoning_effort=agent_llm_config.get("reasoning_effort"),
+                verbosity=agent_llm_config.get("verbosity"),
                 base_url=agent_llm_config.get("api_base")
             )
 
@@ -105,6 +111,17 @@ class AgentLoader:
 
             # Get memory configuration
             memory_config = agent_config.get_memory_config()
+            # Resolve persist path against project root so we never accidentally
+            # write to a non-mounted working directory inside Docker.
+            resolved_persist_path = agent_config.resolve_path(
+                memory_config.get("persist_path", "data/memory/reasoning_bank.json")
+            )
+            resolved_persist_path.parent.mkdir(parents=True, exist_ok=True)
+            # Ensure downstream agent code sees an absolute path (DESAgent uses this
+            # string directly when auto-saving after feedback processing).
+            agent_config.config.setdefault("memory", {})["persist_path"] = str(
+                resolved_persist_path
+            )
 
             # Initialize ReasoningBank components
             # CRITICAL: Pass embedding_func to enable automatic embedding generation
@@ -175,19 +192,31 @@ class AgentLoader:
             logger.info("="*60)
             logger.info("DESAgent initialized successfully")
             logger.info(f"  - Memory auto-save: {memory_config.get('auto_save')}")
-            logger.info(f"  - Memory persist path: {memory_dir / 'reasoning_bank.json'}")
+            logger.info(f"  - Memory persist path: {resolved_persist_path}")
             logger.info(f"  - CoreRAG: {'✓ Ready' if corerag_client else '✗ Unavailable'}")
             logger.info(f"  - LargeRAG: {'✓ Ready' if largerag_client else '✗ Unavailable'}")
             logger.info("="*60)
 
             # Try to load existing memory bank
-            memory_file = memory_dir / "reasoning_bank.json"
-            if memory_file.exists():
+            # Preferred: load from resolved persist path (matches auto-save path)
+            candidate_files = [
+                resolved_persist_path,
+                # Backward-compat: legacy filenames (older configs / docs)
+                memory_dir / "reasoning_bank.json",
+                memory_dir / "des_reasoningbank.json",
+            ]
+            for memory_file in candidate_files:
+                if not memory_file.exists():
+                    continue
                 try:
                     self._agent.memory.load(str(memory_file))
-                    logger.info(f"Loaded existing memory bank: {len(self._agent.memory.memories)} memories")
+                    logger.info(
+                        f"Loaded existing memory bank: {len(self._agent.memory.memories)} memories "
+                        f"({memory_file})"
+                    )
+                    break
                 except Exception as e:
-                    logger.warning(f"Failed to load existing memory bank: {e}")
+                    logger.warning(f"Failed to load existing memory bank from {memory_file}: {e}")
 
         except Exception as e:
             logger.error(f"Failed to initialize DESAgent: {e}", exc_info=True)

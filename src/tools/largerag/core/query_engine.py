@@ -7,6 +7,7 @@
 """
 
 from typing import List, Dict, Any, Optional
+import os
 from llama_index.core import VectorStoreIndex
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.retrievers import VectorIndexRetriever
@@ -19,6 +20,13 @@ import logging
 from ..config.settings import SETTINGS, DASHSCOPE_API_KEY
 
 logger = logging.getLogger(__name__)
+
+
+try:
+    # We keep OpenAI optional: LargeRAG retrieval (get_similar_documents) does not require it.
+    from openai import OpenAI  # type: ignore
+except Exception:  # pragma: no cover
+    OpenAI = None  # type: ignore[assignment]
 
 
 class SimilarityThresholdFilter(BaseNodePostprocessor):
@@ -62,33 +70,65 @@ class LargeRAGQueryEngine:
     def __init__(self, index: VectorStoreIndex):
         self.index = index
         self.settings = SETTINGS
-        self.api_key = DASHSCOPE_API_KEY
+        # DashScope key is still required because the embed_model used by the index is DashScope
+        # (kept intentionally to avoid re-indexing large corpora).
+        self.dashscope_api_key = DASHSCOPE_API_KEY
 
-        if not self.api_key:
+        if not self.dashscope_api_key:
             raise ValueError(
                 "DASHSCOPE_API_KEY is required for query engine. "
                 "Please set it in .env file."
             )
 
-        # 初始化 LLM（使用配置文件中的模型）
-        self.llm = DashScope(
-            model_name=self.settings.llm.model,
-            api_key=self.api_key,
-            temperature=self.settings.llm.temperature,
-            max_tokens=self.settings.llm.max_tokens,
-        )
+        self.llm_provider = (self.settings.llm.provider or "dashscope").strip().lower()
+
+        # LLM used only for `query()` (agent path uses retrieval only).
+        self.llm = None
+        self.openai_client = None
+
+        if self.llm_provider == "dashscope":
+            # 初始化 LLM（使用配置文件中的模型）
+            self.llm = DashScope(
+                model_name=self.settings.llm.model,
+                api_key=self.dashscope_api_key,
+                temperature=self.settings.llm.temperature,
+                max_tokens=self.settings.llm.max_tokens,
+            )
+        elif self.llm_provider == "openai":
+            if OpenAI is None:
+                # Retrieval still works; only `query()` will fail.
+                logger.warning(
+                    "OpenAI python package is not available. LargeRAG.query() will be unavailable."
+                )
+            else:
+                openai_api_key = os.getenv("OPENAI_API_KEY")
+                if not openai_api_key:
+                    logger.warning(
+                        "OPENAI_API_KEY is not set. LargeRAG.query() will be unavailable."
+                    )
+                else:
+                    # Optional override for OpenAI-compatible gateways.
+                    base_url = os.getenv("OPENAI_API_BASE") or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+                    self.openai_client = OpenAI(api_key=openai_api_key, base_url=base_url)
+        else:
+            raise ValueError(
+                f"Unsupported LLM provider: {self.settings.llm.provider!r}. "
+                f"Supported: 'dashscope', 'openai'."
+            )
 
         # 初始化 Reranker
         self.reranker = None
         if self.settings.reranker.enabled:
             self.reranker = DashScopeRerank(
                 model=self.settings.reranker.model,
-                api_key=self.api_key,
+                api_key=self.dashscope_api_key,
                 top_n=self.settings.retrieval.rerank_top_n,
             )
 
         # 构建查询引擎
-        self._build_query_engine()
+        self.query_engine = None
+        if self.llm is not None:
+            self._build_query_engine()
 
     def _build_query_engine(self):
         """构建查询引擎（含 Reranker 和阈值过滤）"""
@@ -128,6 +168,28 @@ class LargeRAGQueryEngine:
             llm=self.llm,
         )
 
+    def _format_docs_for_synthesis(self, docs: List[Dict[str, Any]], max_chars_per_doc: int = 1200) -> str:
+        """Format retrieved docs into a compact context for LLM synthesis."""
+        if not docs:
+            return "(No retrieved documents)"
+
+        parts: List[str] = []
+        for i, doc in enumerate(docs, 1):
+            metadata = doc.get("metadata", {}) or {}
+            doc_hash = str(metadata.get("doc_hash", "unknown"))[:8]
+            page = metadata.get("page_idx", "N/A")
+            score = doc.get("score", 0.0)
+            text = str(doc.get("text", ""))
+
+            if len(text) > max_chars_per_doc:
+                text = text[:max_chars_per_doc] + "..."
+
+            parts.append(
+                f"[Doc {i}] score={score:.3f} source={doc_hash} page={page}\n{text}"
+            )
+
+        return "\n\n".join(parts)
+
     def query(self, query_text: str, **kwargs) -> str:
         """
         执行查询
@@ -140,8 +202,46 @@ class LargeRAGQueryEngine:
             LLM 生成的回答
         """
         logger.info(f"Querying: {query_text}")
-        response = self.query_engine.query(query_text)
-        return str(response)
+
+        if self.llm_provider == "dashscope":
+            if self.query_engine is None:
+                raise RuntimeError("Query engine not initialized (DashScope LLM unavailable).")
+            response = self.query_engine.query(query_text)
+            return str(response)
+
+        if self.llm_provider == "openai":
+            if self.openai_client is None:
+                raise RuntimeError("OpenAI client not initialized. Check OPENAI_API_KEY / OPENAI_API_BASE.")
+
+            top_k = kwargs.get("top_k") or self.settings.retrieval.rerank_top_n
+            docs = self.get_similar_documents(query_text, top_k=int(top_k))
+            context = self._format_docs_for_synthesis(docs)
+
+            system_prompt = (
+                "You are a scientific literature assistant for Deep Eutectic Solvents (DES). "
+                "Answer the user's query using ONLY the provided retrieved documents. "
+                "If the documents are insufficient, say what is missing."
+            )
+            user_prompt = (
+                f"User query:\n{query_text}\n\n"
+                f"Retrieved documents:\n{context}\n\n"
+                "Write a concise, factual answer. Include any key experimental conditions if present."
+            )
+
+            # GPT-5.*: keep reasoning off here (LargeRAG is used for factual grounding, not deep planning).
+            resp = self.openai_client.chat.completions.create(
+                model=self.settings.llm.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=self.settings.llm.temperature,
+                max_completion_tokens=self.settings.llm.max_tokens,
+                reasoning_effort="none",
+            )
+            return (resp.choices[0].message.content or "").strip()
+
+        raise RuntimeError(f"Unsupported llm_provider={self.llm_provider!r}")
 
     def get_similar_documents(
         self,
@@ -199,7 +299,7 @@ class LargeRAGQueryEngine:
             from llama_index.postprocessor.dashscope_rerank import DashScopeRerank
             reranker = DashScopeRerank(
                 model=self.settings.reranker.model,
-                api_key=self.api_key,
+                api_key=self.dashscope_api_key,
                 top_n=max(final_top_k, self.settings.retrieval.rerank_top_n),
             )
             nodes = reranker.postprocess_nodes(nodes, query_str=query_text)

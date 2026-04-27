@@ -8,6 +8,7 @@ the ReasoningBank framework.
 from typing import List, Optional, Dict, Callable
 import json
 import os
+import threading
 from pathlib import Path
 import logging
 
@@ -48,6 +49,9 @@ class ReasoningBank:
         self.memories: List[MemoryItem] = []
         self.embedding_func = embedding_func
         self.max_items = max_items
+        # Protect in-memory mutations and on-disk persistence from concurrent requests
+        # (e.g., async feedback processing with multiple worker threads).
+        self._lock = threading.RLock()
         logger.info(f"Initialized ReasoningBank with max_items={max_items}")
 
     def add_memory(self, memory: MemoryItem, compute_embedding: bool = True) -> None:
@@ -65,7 +69,7 @@ class ReasoningBank:
         if not isinstance(memory, MemoryItem):
             raise ValueError("memory must be a MemoryItem instance")
 
-        # Compute embedding if requested and function is available
+        # Compute embedding outside lock (may be a network call); the item isn't in the bank yet.
         if compute_embedding and self.embedding_func and memory.embedding is None:
             try:
                 # Use title + description for embedding
@@ -76,16 +80,17 @@ class ReasoningBank:
                 logger.warning(f"Failed to compute embedding: {e}")
                 # Continue without embedding
 
-        # Add to collection
-        self.memories.append(memory)
-        logger.info(f"Added memory '{memory.title}' (total: {len(self.memories)})")
+        # Add to collection (thread-safe)
+        with self._lock:
+            self.memories.append(memory)
+            logger.info(f"Added memory '{memory.title}' (total: {len(self.memories)})")
 
-        # Enforce max_items limit (remove oldest)
-        if len(self.memories) > self.max_items:
-            removed = self.memories.pop(0)
-            logger.info(
-                f"Removed oldest memory '{removed.title}' (limit: {self.max_items})"
-            )
+            # Enforce max_items limit (remove oldest)
+            if len(self.memories) > self.max_items:
+                removed = self.memories.pop(0)
+                logger.info(
+                    f"Removed oldest memory '{removed.title}' (limit: {self.max_items})"
+                )
 
     def add_memories(
         self, memories: List[MemoryItem], compute_embeddings: bool = True
@@ -107,7 +112,8 @@ class ReasoningBank:
         Returns:
             List of all MemoryItem objects
         """
-        return self.memories.copy()
+        with self._lock:
+            return self.memories.copy()
 
     def get_memory_by_title(self, title: str) -> Optional[MemoryItem]:
         """
@@ -119,10 +125,11 @@ class ReasoningBank:
         Returns:
             MemoryItem if found, None otherwise
         """
-        for memory in self.memories:
-            if memory.title == title:
-                return memory
-        return None
+        with self._lock:
+            for memory in self.memories:
+                if memory.title == title:
+                    return memory
+            return None
 
     def filter_memories(self, filters: Dict) -> List[MemoryItem]:
         """
@@ -134,26 +141,27 @@ class ReasoningBank:
         Returns:
             List of matching MemoryItem objects
         """
-        filtered = []
-        for memory in self.memories:
-            match = True
-            for key, value in filters.items():
-                # Check top-level attributes
-                if hasattr(memory, key):
-                    if getattr(memory, key) != value:
+        with self._lock:
+            filtered = []
+            for memory in self.memories:
+                match = True
+                for key, value in filters.items():
+                    # Check top-level attributes
+                    if hasattr(memory, key):
+                        if getattr(memory, key) != value:
+                            match = False
+                            break
+                    # Check metadata
+                    elif key in memory.metadata:
+                        if memory.metadata[key] != value:
+                            match = False
+                            break
+                    else:
                         match = False
                         break
-                # Check metadata
-                elif key in memory.metadata:
-                    if memory.metadata[key] != value:
-                        match = False
-                        break
-                else:
-                    match = False
-                    break
 
-            if match:
-                filtered.append(memory)
+                if match:
+                    filtered.append(memory)
 
         logger.debug(
             f"Filtered {len(filtered)}/{len(self.memories)} memories with {filters}"
@@ -186,22 +194,25 @@ class ReasoningBank:
         Raises:
             IOError: If file cannot be written
         """
-        # Create parent directory if needed
-        Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Serialize memories
-        data = {
-            "version": "1.0",
-            "max_items": self.max_items,
-            "num_memories": len(self.memories),
-            "memories": [memory.to_dict() for memory in self.memories],
-        }
+        with self._lock:
+            # Serialize memories
+            data = {
+                "version": "1.0",
+                "max_items": self.max_items,
+                "num_memories": len(self.memories),
+                "memories": [memory.to_dict() for memory in self.memories],
+            }
 
-        # Write to file
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+            # Atomic write to prevent partial files during crashes / concurrent writes.
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, path)
 
-        logger.info(f"Saved {len(self.memories)} memories to {filepath}")
+            logger.info(f"Saved {len(self.memories)} memories to {filepath}")
 
     def load(self, filepath: str) -> None:
         """
@@ -217,23 +228,24 @@ class ReasoningBank:
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"Memory file not found: {filepath}")
 
-        with open(filepath, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        with self._lock:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
 
-        # Validate version (future-proofing)
-        version = data.get("version", "1.0")
-        if version != "1.0":
-            logger.warning(f"Loading memory file with version {version} (expected 1.0)")
+            # Validate version (future-proofing)
+            version = data.get("version", "1.0")
+            if version != "1.0":
+                logger.warning(f"Loading memory file with version {version} (expected 1.0)")
 
-        # Load memories
-        memories_data = data.get("memories", [])
-        self.memories = [MemoryItem.from_dict(m) for m in memories_data]
+            # Load memories
+            memories_data = data.get("memories", [])
+            self.memories = [MemoryItem.from_dict(m) for m in memories_data]
 
-        # Update max_items if specified
-        if "max_items" in data:
-            self.max_items = data["max_items"]
+            # Update max_items if specified
+            if "max_items" in data:
+                self.max_items = data["max_items"]
 
-        logger.info(f"Loaded {len(self.memories)} memories from {filepath}")
+            logger.info(f"Loaded {len(self.memories)} memories from {filepath}")
 
     def delete_by_title(self, title: str) -> bool:
         """
@@ -245,9 +257,10 @@ class ReasoningBank:
         Returns:
             True if memory was deleted, False if not found
         """
-        original_count = len(self.memories)
-        self.memories = [m for m in self.memories if m.title != title]
-        deleted = len(self.memories) < original_count
+        with self._lock:
+            original_count = len(self.memories)
+            self.memories = [m for m in self.memories if m.title != title]
+            deleted = len(self.memories) < original_count
 
         if deleted:
             logger.info(f"Deleted memory with title: {title}")
@@ -269,12 +282,13 @@ class ReasoningBank:
         Returns:
             Number of memories deleted
         """
-        original_count = len(self.memories)
-        self.memories = [
-            m for m in self.memories
-            if m.metadata.get("recommendation_id") != recommendation_id
-        ]
-        deleted_count = original_count - len(self.memories)
+        with self._lock:
+            original_count = len(self.memories)
+            self.memories = [
+                m for m in self.memories
+                if m.metadata.get("recommendation_id") != recommendation_id
+            ]
+            deleted_count = original_count - len(self.memories)
 
         logger.info(
             f"Deleted {deleted_count} memories for recommendation {recommendation_id} "
@@ -284,8 +298,9 @@ class ReasoningBank:
 
     def clear(self) -> None:
         """Clear all memories from the bank."""
-        count = len(self.memories)
-        self.memories = []
+        with self._lock:
+            count = len(self.memories)
+            self.memories = []
         logger.info(f"Cleared {count} memories from ReasoningBank")
 
     def get_statistics(self) -> Dict:
@@ -295,29 +310,31 @@ class ReasoningBank:
         Returns:
             Dictionary with statistics
         """
-        if not self.memories:
+        with self._lock:
+            if not self.memories:
+                return {
+                    "total_memories": 0,
+                    "from_success": 0,
+                    "from_failure": 0,
+                    "with_embeddings": 0,
+                }
+
+            success_count = sum(1 for m in self.memories if m.is_from_success)
+            with_embedding = sum(1 for m in self.memories if m.embedding is not None)
+
             return {
-                "total_memories": 0,
-                "from_success": 0,
-                "from_failure": 0,
-                "with_embeddings": 0,
+                "total_memories": len(self.memories),
+                "from_success": success_count,
+                "from_failure": len(self.memories) - success_count,
+                "with_embeddings": with_embedding,
+                "max_capacity": self.max_items,
+                "utilization": f"{len(self.memories) / self.max_items * 100:.1f}%",
             }
-
-        success_count = sum(1 for m in self.memories if m.is_from_success)
-        with_embedding = sum(1 for m in self.memories if m.embedding is not None)
-
-        return {
-            "total_memories": len(self.memories),
-            "from_success": success_count,
-            "from_failure": len(self.memories) - success_count,
-            "with_embeddings": with_embedding,
-            "max_capacity": self.max_items,
-            "utilization": f"{len(self.memories) / self.max_items * 100:.1f}%",
-        }
 
     def __len__(self) -> int:
         """Return number of memories in the bank."""
-        return len(self.memories)
+        with self._lock:
+            return len(self.memories)
 
     def __repr__(self) -> str:
         """String representation of ReasoningBank."""

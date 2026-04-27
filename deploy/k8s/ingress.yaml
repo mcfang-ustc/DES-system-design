@@ -1,0 +1,40 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: des-agent-ingress-https
+  namespace: core-storage
+ 
+  annotations:
+    kubernetes.io/ingress.class: "traefik"
+    traefik.ingress.kubernetes.io/router.entrypoints: "websecure"
+    traefik.ingress.kubernetes.io/router.tls: "true"
+
+spec: 
+  ingressClassName: "traefik"
+  # TLS 配置 (指定证书存放的 Secret)
+  tls:
+    - hosts:
+        - des-agent.pic-aichem.online
+      secretName: custom-app-tls-secret # 你的证书 Secret
+
+  rules:
+    - host: des-agent.pic-aichem.online
+      http:
+        paths:
+          # --- 匹配 Stream Load 和 SQL 接口 ---
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: des # 你的 FE Service 名字
+                port:
+                  number: 8000          # 必须是 FE 的 HTTP 端口 (默认 8030)
+          
+          # (可选) 暴露 Web UI
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: des
+                port:
+                  number: 80

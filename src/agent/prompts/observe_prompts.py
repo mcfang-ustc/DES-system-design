@@ -65,6 +65,11 @@ Analyze the action result and provide structured insights to guide the agent's n
    - Options: retrieve_memories, query_theory, query_literature, query_parallel, generate_formulation, refine_formulation, finish
    - Base recommendation on: information gaps + progress stage + tool availability
    - **CRITICAL**: If a tool has failed 2+ times, DO NOT recommend it again
+   - **Parallel policy**: Do NOT recommend query_parallel as a default. Recommend it only when you explicitly need BOTH theory + literature AND at least one is still missing. If both are already available, prefer generate_formulation/refine_formulation.
+
+7. **Stagnation Detected**: Are we looping without gaining new information?
+   - Set to true when: key insights and information gaps are repeating, and the latest action did not add new quantitative/decisive evidence.
+   - If stagnation is true: recommend generating/refining a formulation or finishing (do not keep querying).
 
 **Special Considerations**:
 
@@ -92,7 +97,8 @@ Respond with ONLY a valid JSON object (no markdown, no explanation):
         "<specific gap 1>",
         "<specific gap 2>"
     ],
-    "information_sufficient": true/false,
+    "information_sufficient": false,
+    "stagnation_detected": false,
     "recommended_next_action": "<action_name>",
     "recommendation_reasoning": "<1 sentence explaining why this action is recommended>"
 }}
@@ -112,6 +118,7 @@ Respond with ONLY a valid JSON object (no markdown, no explanation):
         "Missing comparative performance data between glycerol and urea at target temperature"
     ],
     "information_sufficient": false,
+    "stagnation_detected": false,
     "recommended_next_action": "query_theory",
     "recommendation_reasoning": "Have literature precedents but need theoretical understanding of why glycerol outperforms urea at low temperature to make informed selection"
 }}
@@ -192,6 +199,19 @@ def format_action_result_for_observe(action: str, action_result: dict, knowledge
         result_text += f"**Confidence**: {formulation.get('confidence', 0.0)}\n"
         result_text += f"**Reasoning**: {formulation.get('reasoning', 'N/A')[:200]}...\n"
 
+        acc = formulation.get("_acceptance") if isinstance(formulation, dict) else None
+        if isinstance(acc, dict):
+            result_text += (
+                f"**Acceptance**: accepted={acc.get('accepted')} "
+                f"class={acc.get('recommendation_class')} "
+                f"reasons={acc.get('reasons')}\n"
+            )
+            result_text += f"**Baseline Reference**: {formulation.get('baseline_reference', 'none')}\n"
+            delta = formulation.get("delta_to_baseline")
+            if isinstance(delta, list):
+                preview = delta[:2]
+                result_text += f"**Delta Preview (first 2)**: {preview}\n"
+
     return result_text
 
 
@@ -207,22 +227,20 @@ def parse_observe_output(llm_output: str) -> dict:
     Returns:
         Dict with observation fields
     """
-    import json
-    import re
+    from ..utils.json_extract import loads_json_from_text
 
-    # Try to extract JSON (handle potential markdown wrapping)
-    json_match = re.search(r'```json\s*(.*?)\s*```', llm_output, re.DOTALL)
-    if json_match:
-        try:
-            return json.loads(json_match.group(1))
-        except json.JSONDecodeError:
-            pass
-
-    # Try to parse as direct JSON
-    try:
-        return json.loads(llm_output.strip())
-    except json.JSONDecodeError:
-        pass
+    parsed = loads_json_from_text(llm_output)
+    if isinstance(parsed, dict):
+        # Ensure required keys exist so downstream logging/trajectory never KeyErrors.
+        parsed.setdefault("summary", "No summary provided")
+        parsed.setdefault("knowledge_updated", [])
+        parsed.setdefault("key_insights", [])
+        parsed.setdefault("information_gaps", [])
+        parsed.setdefault("information_sufficient", False)
+        parsed.setdefault("stagnation_detected", False)
+        parsed.setdefault("recommended_next_action", "generate_formulation")
+        parsed.setdefault("recommendation_reasoning", "")
+        return parsed
 
     # Fallback: return minimal structure
     return {
@@ -231,6 +249,7 @@ def parse_observe_output(llm_output: str) -> dict:
         "key_insights": [],
         "information_gaps": [],
         "information_sufficient": False,
+        "stagnation_detected": False,
         "recommended_next_action": "generate_formulation",
-        "recommendation_reasoning": "Fallback action due to parsing error"
+        "recommendation_reasoning": "Fallback action due to parsing error",
     }

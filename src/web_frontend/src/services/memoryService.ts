@@ -29,7 +29,7 @@ export const memoryService = {
     params?: MemoryListParams
   ): Promise<MemoryListResponse> => {
     const response = await api.get<MemoryListResponse>(
-      '/api/v1/memories',
+      '/api/v1/memories/',
       { params }
     );
     return response.data;
@@ -54,7 +54,7 @@ export const memoryService = {
     memoryData: MemoryItemCreate
   ): Promise<MemoryCreateResponse> => {
     const response = await api.post<MemoryCreateResponse>(
-      '/api/v1/memories',
+      '/api/v1/memories/',
       memoryData
     );
     return response.data;

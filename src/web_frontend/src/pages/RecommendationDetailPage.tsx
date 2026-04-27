@@ -330,21 +330,70 @@ function RecommendationDetailPage() {
         <Divider orientation="left">生成轨迹</Divider>
         <Card type="inner">
           <List
-            dataSource={detail.trajectory.steps.filter(
-              (step) => step.action !== 'unknown' && step.reasoning && step.reasoning.trim() !== ''
-            )}
+            dataSource={detail.trajectory.steps.filter((step) => {
+              const text =
+                (step.reasoning && step.reasoning.trim()) ||
+                (step.result_summary && step.result_summary.trim()) ||
+                (step.observation && step.observation.trim()) ||
+                '';
+              return step.action !== 'unknown' && text !== '';
+            })}
             renderItem={(step, index) => (
               <List.Item>
                 <Space direction="vertical" style={{ width: '100%' }}>
-                  <Text strong>步骤 {index + 1}: {step.action}</Text>
+                  <Space wrap>
+                    <Text strong>步骤 {index + 1}: {step.action}</Text>
+                    {step.phase && (
+                      <Tag
+                        color={
+                          step.phase === 'think'
+                            ? 'blue'
+                            : step.phase === 'act'
+                            ? 'purple'
+                            : step.phase === 'observe'
+                            ? 'green'
+                            : 'default'
+                        }
+                      >
+                        {step.phase.toUpperCase()}
+                      </Tag>
+                    )}
+                    {step.iteration !== null && step.iteration !== undefined && (
+                      <Tag color="geekblue">Iter {step.iteration}</Tag>
+                    )}
+                  </Space>
                   <Paragraph style={{ marginLeft: 16, marginBottom: 0 }}>
-                    {step.reasoning}
+                    {step.reasoning && step.reasoning.trim() !== ''
+                      ? step.reasoning
+                      : step.result_summary && step.result_summary.trim() !== ''
+                      ? step.result_summary
+                      : step.observation}
                   </Paragraph>
                   {step.tool && (
                     <Tag color="purple">工具: {step.tool}</Tag>
                   )}
                   {step.num_memories !== null && step.num_memories !== undefined && (
                     <Tag color="cyan">检索到记忆数: {step.num_memories}</Tag>
+                  )}
+                  {step.key_insights && step.key_insights.length > 0 && (
+                    <div style={{ marginLeft: 16 }}>
+                      <Text type="secondary">关键洞察：</Text>
+                      <ul style={{ marginTop: 8, marginBottom: 0 }}>
+                        {step.key_insights.map((k, i) => (
+                          <li key={i}>{String(k)}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {step.information_gaps && step.information_gaps.length > 0 && (
+                    <div style={{ marginLeft: 16 }}>
+                      <Text type="secondary">信息缺口：</Text>
+                      <ul style={{ marginTop: 8, marginBottom: 0 }}>
+                        {step.information_gaps.map((g, i) => (
+                          <li key={i}>{String(g)}</li>
+                        ))}
+                      </ul>
+                    </div>
                   )}
                 </Space>
               </List.Item>

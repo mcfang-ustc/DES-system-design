@@ -7,18 +7,25 @@
 
 # LLM Configuration
 llm:
-  provider: "dashscope"  # "dashscope" (Aliyun) or "openai" or "custom"
-  model: "qwen-plus"  # DashScope: qwen-plus, qwen-turbo, qwen-max | OpenAI: gpt-4o-mini, gpt-4o
-  temperature: 0.1  # For agent reasoning
+  provider: "openai"  # "dashscope" (Aliyun) or "openai" or "custom"
+  model: "gpt-5.2"  # Aux LLM for extractor/judge (keep reasoning off so temperature works)
+  temperature: 0.1
   max_tokens: 5000
-  api_base: null  # Auto-set by provider. Custom: "https://your-endpoint.com/v1"
+  # OpenAI-only knobs (safe to keep for other providers; they will be ignored)
+  # reasoning_effort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+  reasoning_effort: "xhigh"
+  api_base: null  # Optional override; OPENAI_API_BASE / OPENAI_BASE_URL env vars take precedence.
 
 # Agent LLM (may use different model for main reasoning)
 agent_llm:
-  provider: "dashscope"
-  model: "qwen-plus"  # Higher capability for formulation design
+  provider: "openai"
+  model: "gpt-5.2"  # Higher capability for formulation design
   temperature: 0.1
   max_tokens: 5000
+  # Enable GPT-5.2 reasoning. When reasoning_effort != "none", the client will
+  # automatically omit incompatible sampling params (temperature/top_p/logprobs).
+  reasoning_effort: "xhigh"
+  api_base: null  # Optional override; OPENAI_API_BASE / OPENAI_BASE_URL env vars take precedence.
 
 # Embedding Configuration
 embedding:
@@ -32,7 +39,9 @@ memory:
   retrieval_top_k: 3  # Number of memories to retrieve per query
   extraction_max_per_trajectory: 3  # Max memories from single trajectory
   min_similarity: 0.0  # Minimum similarity threshold (0-1)
-  persist_path: "data/memory/des_reasoningbank.json"
+  # Persisted ReasoningBank file. The web backend resolves this relative path
+  # against project root so it lands in the Docker-mounted volume (/app/data).
+  persist_path: "data/memory/reasoning_bank.json"
   auto_save: true  # Auto-save after each consolidation
 
 # Async Experimental Feedback Configuration (NEW)
@@ -81,9 +90,16 @@ logging:
 # Agent Behavior (ReAct Loop Configuration)
 agent:
   # ReAct Loop Parameters
-  max_iterations: 5  # Maximum ReAct iterations (Think-Act-Observe cycles)
+  max_iterations: 20  # Maximum ReAct iterations (Think-Act-Observe cycles)
   enable_memory_injection: true  # Inject retrieved memories into prompt
   explain_memory_usage: true  # Agent should explain why it uses each memory
+
+  # Planning / Query Policy (P2)
+  # Hard caps to prevent runaway tool usage (especially CoreRAG).
+  # Note: query_parallel consumes BOTH budgets when both tools run.
+  max_corerag_queries: 3
+  max_largerag_queries: 8
+  max_parallel_queries: 3
 
   # Stopping Conditions
   auto_finish_threshold: 0.9  # Auto-finish if formulation confidence >= this value
@@ -92,6 +108,22 @@ agent:
   # Formulation Design
   default_num_components: 2  # Default DES type: 2=binary, 3=ternary, 4=quaternary, etc.
   allow_multi_component: true  # Allow agent to suggest multi-component DES
+
+  # Structured Output Reliability (P0)
+  # Two-stage generation: (1) reasoning draft, (2) strict schema output with reasoning_effort=none.
+  draft_max_tokens: 1400
+  structured_reasoning_effort: "none"
+  structured_temperature: 0.0
+  structured_max_tokens: 1800
+
+  # Candidate acceptance (P0/P2)
+  # - Baseline repeats are detected via formulation signatures.
+  # - A baseline repeat may still be accepted if it is proven strong (>= baseline_min_percent).
+  # - If a relevant baseline exists, RECOMMENDATION candidates must provide delta_to_baseline.
+  acceptance:
+    baseline_min_percent: 80.0
+    temperature_tolerance_C: 0.5
+    require_delta_when_baseline_exists: true
 
   # Deprecated (use max_iterations instead)
   # max_steps: 10

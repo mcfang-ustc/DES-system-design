@@ -19,7 +19,7 @@ export const feedbackService = {
     feedbackData: FeedbackRequest
   ): Promise<FeedbackAsyncResponse> => {
     const response = await api.post<FeedbackAsyncResponse>(
-      '/api/v1/feedback',
+      '/api/v1/feedback/',
       feedbackData
     );
     return response.data;

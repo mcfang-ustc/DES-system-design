@@ -33,6 +33,9 @@ class ConfigLoader:
                         If None, uses default: src/agent/config/reasoningbank_config.yaml
         """
         if config_path is None:
+            config_path = os.getenv("AGENT_CONFIG_PATH")
+
+        if config_path is None:
             # Default: find config relative to this file
             config_path = Path(__file__).parent / "reasoningbank_config.yaml"
 
@@ -100,7 +103,7 @@ class ConfigLoader:
         Resolve path relative to project root.
 
         Args:
-            path: Relative path string (e.g., "data/memory/des_reasoningbank.json")
+            path: Relative path string (e.g., "data/memory/reasoning_bank.json")
 
         Returns:
             Absolute Path object
@@ -191,8 +194,17 @@ def get_config(config_path: Optional[str] = None) -> ConfigLoader:
     """
     global _config_loader
 
+    if config_path is None:
+        config_path = os.getenv("AGENT_CONFIG_PATH")
+
     if _config_loader is None:
         _config_loader = ConfigLoader(config_path)
+    elif config_path is not None:
+        requested_path = Path(config_path).expanduser().resolve()
+        current_path = _config_loader.config_path.expanduser().resolve()
+        if requested_path != current_path:
+            logger.info(f"Reloading config from: {requested_path}")
+            _config_loader = ConfigLoader(str(requested_path))
 
     return _config_loader
 

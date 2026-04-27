@@ -100,17 +100,35 @@ function FeedbackPage() {
   const handleSubmit = async (values: ExperimentResultRequest) => {
     if (!id) return;
 
-    // Basic validation: require at least one measurement row
+    // Validation:
+    // - If liquid formed: require at least one measurement row and at least one leaching_efficiency value
+    // - If not formed: measurements can be empty; if provided, leaching_efficiency must be empty/0
     const measurements = values.measurements || [];
-    if (measurements.length === 0) {
-      message.error('请至少添加一条浸出效率测量记录');
-      return;
-    }
-    // 如果液体形成，要求至少有一条带浸出效率的测量
+
     if (values.is_liquid_formed) {
+      if (measurements.length === 0) {
+        message.error('液体形成时，请至少添加一条浸出效率测量记录');
+        return;
+      }
+      // 如果液体形成，要求至少有一条带浸出效率的测量
       const hasSol = measurements.some((m) => m.leaching_efficiency !== undefined && m.leaching_efficiency !== null);
       if (!hasSol) {
         message.error('液体形成时，请在测量记录中提供至少一个浸出效率数值');
+        return;
+      }
+    } else {
+      // If not formed, allow empty measurements; but if provided, disallow positive efficiency values.
+      const badIndex = measurements.findIndex(
+        (m) => m.leaching_efficiency !== undefined && m.leaching_efficiency !== null && m.leaching_efficiency !== 0
+      );
+      if (badIndex !== -1) {
+        form.setFields([
+          {
+            name: ['measurements', badIndex, 'leaching_efficiency'] as any,
+            errors: ['液体未形成时，不应填写浸出效率（请清空或填写 0）'],
+          },
+        ]);
+        message.error('液体未形成时，不应填写浸出效率（请清空或填写 0）');
         return;
       }
     }
@@ -453,7 +471,19 @@ function FeedbackPage() {
             </Form.Item>
           </Space>
 
-          <Divider orientation="left">浸出效率测量（长表模式）</Divider>
+          <Divider orientation="left">
+            {isLiquidFormed ? '浸出效率测量（长表模式，液体形成时必填）' : '浸出效率测量（长表模式，可选）'}
+          </Divider>
+
+          {!isLiquidFormed && (
+            <Alert
+              type="info"
+              showIcon
+              message="液体未形成时，浸出效率测量可不填写"
+              description="如果 DES 液体未形成，您可以不添加测量记录；如需记录，请不要填写浸出效率（留空或填写 0），并在观察/备注中说明。"
+              style={{ marginBottom: 16 }}
+            />
+          )}
           <Form.List name="measurements">
             {(fields, { add, remove }) => (
               <>
@@ -482,7 +512,13 @@ function FeedbackPage() {
                         name={[field.name, 'leaching_efficiency']}
                         rules={[{ type: 'number', min: 0, message: '必须为非负数' }]}
                       >
-                        <InputNumber min={0} step={0.1} style={{ width: 140 }} placeholder="可选" />
+                        <InputNumber
+                          min={0}
+                          max={isLiquidFormed ? undefined : 0}
+                          step={0.1}
+                          style={{ width: 140 }}
+                          placeholder={isLiquidFormed ? '至少一条需填写' : '留空或 0'}
+                        />
                       </Form.Item>
                       <Form.Item
                         {...field}

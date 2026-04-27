@@ -1,0 +1,520 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: des-backend-config
+data:
+  corerag_settings.yaml: |-
+    # ============================================
+    # CoreRAG production config (mounted into container)
+    # ============================================
+    ontology:
+      directory_path: "/app/src/tools/corerag/data/ontology/"
+      ontology_file_name: "DES.owl"
+      base_iri: "http://www.test.org/chem_ontologies/"
+      java_exe: ""
+
+    entity_retrieval:
+      top_k: 5
+      bm25_weight: 0.5
+      jaccard_weight: 0.5
+      trigram_size: 3
+      min_score_threshold: 0.1
+
+    LLM:
+      model: "gpt-5.2"
+      streaming: false
+      temperature: 0
+      max_tokens: 5000
+      # OpenAI GPT-5.* reasoning controls
+      # - "none": allows sampling params like temperature
+      # - other values: enable deeper reasoning; temperature/top_p/logprobs will be omitted automatically
+      reasoning_effort: "none"
+      verbosity: "medium"
+      openai_api_base: "https://api.openai.com/v1"
+
+    extractor_examples:
+      individual_directory_path: "/app/data/extractor_examples/concept/"
+      concept_file_path: "{{individual_directory_path}}concepts.json"
+
+    dataset_construction:
+      folder_path: "/app/data/"
+      raw_data_folder_path: "{{folder_path}}processed_texts"
+      devset_file_path: "{{folder_path}}datasets/devset.json"
+      trainset_file_path: "{{folder_path}}datasets/trainset.json"
+
+  largerag_settings.yaml: |-
+    # ============================================
+    # LargeRAG production config (mounted into container)
+    # ============================================
+    embedding:
+      provider: "dashscope"
+      model: "text-embedding-v4"
+      text_type: "document"
+      batch_size: 10
+      dimension: 2048
+
+    vector_store:
+      type: "chroma"
+      persist_directory: "/app/src/tools/largerag/data/chroma_db_prod"
+      collection_name: "des_prod_v3"
+      distance_metric: "cosine"
+
+    document_processing:
+      splitter_type: "token"
+      chunk_size: 512
+      chunk_overlap: 50
+      separator: "\n\n"
+      aggregate_small_chunks: false
+      semantic_breakpoint_threshold: 0.5
+      semantic_buffer_size: 1
+
+    retrieval:
+      similarity_top_k: 30
+      rerank_top_n: 15
+      similarity_threshold: 0.5
+      rerank_threshold: 0.0
+
+    reranker:
+      provider: "dashscope"
+      model: "qwen3-rerank"
+      enabled: true
+
+    llm:
+      provider: "openai"
+      model: "gpt-5.2"
+      temperature: 0.1
+      max_tokens: 3000
+
+    cache:
+      enabled: true
+      type: "local"
+      local_cache_dir: "/app/src/tools/largerag/data/prod_cache/"
+      redis_host: "localhost"
+      redis_port: 6379
+      collection_name: "des_prod_docker"
+      ttl: 86400
+
+    logging:
+      level: "INFO"
+      file_path: "/app/logs/largerag.log"
+      format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+  reasoningbank_config.yaml: |-
+    # ReasoningBank Configuration for DES Formulation Agent
+
+    # API Keys Configuration:
+    # - DashScope: Set DASHSCOPE_API_KEY in .env file
+    # - OpenAI: Set OPENAI_API_KEY in .env file
+    # API clients automatically load keys from environment variables
+
+    # LLM Configuration
+    llm:
+      provider: "openai"  # "dashscope" (Aliyun) or "openai" or "custom"
+      model: "gpt-5.2"  # Aux LLM for extractor/judge (keep reasoning off so temperature works)
+      temperature: 0.1
+      max_tokens: 5000
+      # OpenAI-only knobs (safe to keep for other providers; they will be ignored)
+      # reasoning_effort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+      reasoning_effort: "xhigh"
+      api_base: null  # Optional override; OPENAI_API_BASE / OPENAI_BASE_URL env vars take precedence.
+
+    # Agent LLM (may use different model for main reasoning)
+    agent_llm:
+      provider: "openai"
+      model: "gpt-5.2"  # Higher capability for formulation design
+      temperature: 0.1
+      max_tokens: 5000
+      # Enable GPT-5.2 reasoning. When reasoning_effort != "none", the client will
+      # automatically omit incompatible sampling params (temperature/top_p/logprobs).
+      reasoning_effort: "xhigh"
+      api_base: null  # Optional override; OPENAI_API_BASE / OPENAI_BASE_URL env vars take precedence.
+
+    # Embedding Configuration
+    embedding:
+      provider: "dashscope"  # "dashscope" (Aliyun) or "openai"
+      model: "text-embedding-v4"  # DashScope: text-embedding-v3 | OpenAI: text-embedding-3-small
+      dimension: 2048  # Auto-detected. OpenAI supports custom dimensions (e.g., 512, 1536)
+
+    # Memory Bank Configuration
+    memory:
+      max_items: 1000
+      retrieval_top_k: 3  # Number of memories to retrieve per query
+      extraction_max_per_trajectory: 3  # Max memories from single trajectory
+      min_similarity: 0.0  # Minimum similarity threshold (0-1)
+      # Persisted ReasoningBank file. The web backend resolves this relative path
+      # against project root so it lands in the Docker-mounted volume (/app/data).
+      persist_path: "data/memory/reasoning_bank.json"
+      auto_save: true  # Auto-save after each consolidation
+
+    # Async Experimental Feedback Configuration (NEW)
+    recommendations:
+      storage_path: "data/recommendations"  # Directory path for recommendation JSON files
+      auto_create_dirs: true  # Auto-create storage directory if not exists
+
+    # Judge Configuration
+    judge:
+      temperature: 0.0  # Deterministic for consistency
+      use_judge: true  # Whether to use LLM judge (set false for oracle evaluation)
+
+    # Extractor Configuration
+    extractor:
+      temperature: 1.0  # Higher temperature for diverse memory generation
+      use_parallel_extraction: false  # Enable MaTTS parallel extraction
+
+    # Tool Integration
+    tools:
+      corerag:
+        enabled: true
+        max_results: 5
+        timeout: 1000  # seconds
+
+      largerag:
+        enabled: true  # Set to false if not ready
+        max_results: 10
+        timeout: 300
+
+      experimental_data:
+        enabled: false  # Not implemented yet
+
+    # MaTTS (Memory-Aware Test-Time Scaling)
+    matts:
+      enabled: false  # Enable after Phase 4
+      parallel_k: 3  # Number of parallel trajectories
+      sequential_steps: 2  # Number of refinement steps
+      use_self_contrast: true  # Use self-contrast for parallel extraction
+
+    # Logging
+    logging:
+      level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+      log_file: "logs/reasoningbank.log"
+      console: true
+
+    # Agent Behavior (ReAct Loop Configuration)
+    agent:
+      # ReAct Loop Parameters
+      max_iterations: 20  # Maximum ReAct iterations (Think-Act-Observe cycles)
+      enable_memory_injection: true  # Inject retrieved memories into prompt
+      explain_memory_usage: true  # Agent should explain why it uses each memory
+
+      # Planning / Query Policy (P2)
+      # Hard caps to prevent runaway tool usage (especially CoreRAG).
+      # Note: query_parallel consumes BOTH budgets when both tools run.
+      max_corerag_queries: 3
+      max_largerag_queries: 8
+      max_parallel_queries: 3
+
+      # Stopping Conditions
+      auto_finish_threshold: 0.9  # Auto-finish if formulation confidence >= this value
+      allow_early_stopping: true  # Allow LLM to decide "finish" before max_iterations
+
+      # Formulation Design
+      default_num_components: 2  # Default DES type: 2=binary, 3=ternary, 4=quaternary, etc.
+      allow_multi_component: true  # Allow agent to suggest multi-component DES
+
+      # Structured Output Reliability (P0)
+      # Two-stage generation: (1) reasoning draft, (2) strict schema output with reasoning_effort=none.
+      draft_max_tokens: 1400
+      structured_reasoning_effort: "none"
+      structured_temperature: 0.0
+      structured_max_tokens: 1800
+
+      # Candidate acceptance (P0/P2)
+      # - Baseline repeats are detected via formulation signatures.
+      # - A baseline repeat may still be accepted if it is proven strong (>= baseline_min_percent).
+      # - If a relevant baseline exists, RECOMMENDATION candidates must provide delta_to_baseline.
+      acceptance:
+        baseline_min_percent: 80.0
+        temperature_tolerance_C: 0.5
+        require_delta_when_baseline_exists: true
+
+      # Deprecated (use max_iterations instead)
+      # max_steps: 10
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: des-nginx-config
+data:
+  default.conf: |-
+    server {
+        listen 80;
+        server_name localhost;
+
+        root /usr/share/nginx/html;
+        index index.html;
+
+        gzip on;
+        gzip_vary on;
+        gzip_min_length 1024;
+        gzip_types text/plain text/css text/xml text/javascript application/x-javascript application/xml+rss application/javascript application/json;
+
+        # Frontend + backend are in the same Pod, so proxy to localhost.
+        location /api/ {
+            proxy_pass http://127.0.0.1:8000/api/;
+            proxy_http_version 1.1;
+
+            proxy_set_header Host $http_host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection 'upgrade';
+            proxy_cache_bypass $http_upgrade;
+
+            proxy_connect_timeout 60s;
+            proxy_send_timeout 60s;
+            proxy_read_timeout 60s;
+        }
+
+        location /docs {
+            proxy_pass http://127.0.0.1:8000/docs;
+            proxy_http_version 1.1;
+            proxy_set_header Host $http_host;
+            proxy_set_header X-Real-IP $remote_addr;
+        }
+
+        location /redoc {
+            proxy_pass http://127.0.0.1:8000/redoc;
+            proxy_http_version 1.1;
+            proxy_set_header Host $http_host;
+            proxy_set_header X-Real-IP $remote_addr;
+        }
+
+        location / {
+            try_files $uri $uri/ /index.html;
+
+            location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
+                expires 1y;
+                add_header Cache-Control "public, immutable";
+            }
+        }
+
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-XSS-Protection "1; mode=block" always;
+
+        server_tokens off;
+    }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: des-data-pvc
+  labels:
+    app: des
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: "longhorn"
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: des-logs-pvc
+  labels:
+    app: des
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: "longhorn"
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: des-corerag-data-pvc
+  labels:
+    app: des
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: "longhorn"
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: des-largerag-data-pvc
+  labels:
+    app: des
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: des
+  labels:
+    app: des
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: des
+  template:
+    metadata:
+      labels:
+        app: des
+    spec:
+      initContainers:
+        - name: init-volumes
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              mkdir -p /app/data/recommendations /app/data/memory /app/data/extractor_examples/concept
+              mkdir -p /app/src/tools/corerag/data/ontology
+              mkdir -p /app/src/tools/largerag/data/chroma_db_prod /app/src/tools/largerag/data/prod_cache
+          volumeMounts:
+            - name: des-data
+              mountPath: /app/data
+            - name: corerag-data
+              mountPath: /app/src/tools/corerag/data
+            - name: largerag-data
+              mountPath: /app/src/tools/largerag/data
+      containers:
+        - name: backend
+          image: harbor.pic-aichem.online/sunyk/des-system-design-backend:v0.1.2
+          imagePullPolicy: Always
+          imagePullSecrets: 
+            - name: harbor-auth
+          ports:
+            - name: http-backend
+              containerPort: 8000
+          env:
+            - name: PROJECT_ROOT
+              value: "/app/"
+            - name: API_HOST
+              value: "0.0.0.0"
+            - name: API_PORT
+              value: "8000"
+            - name: API_RELOAD
+              value: "false"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: CORS_ORIGINS
+              value: "http://localhost,http://127.0.0.1"
+            - name: OPENAI_API_BASE
+              value: "https://api.openai.com/v1"
+            - name: DASHSCOPE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: des-secrets
+                  key: DASHSCOPE_API_KEY
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: des-secrets
+                  key: OPENAI_API_KEY
+          volumeMounts:
+            - name: des-data
+              mountPath: /app/data
+            - name: des-logs
+              mountPath: /app/logs
+            - name: corerag-data
+              mountPath: /app/src/tools/corerag/data
+            - name: largerag-data
+              mountPath: /app/src/tools/largerag/data
+            - name: des-backend-config
+              mountPath: /app/src/tools/corerag/config/settings.yaml
+              subPath: corerag_settings.yaml
+              readOnly: true
+            - name: des-backend-config
+              mountPath: /app/src/tools/largerag/config/settings.yaml
+              subPath: largerag_settings.yaml
+              readOnly: true
+            - name: des-backend-config
+              mountPath: /app/src/agent/config/reasoningbank_config.yaml
+              subPath: reasoningbank_config.yaml
+              readOnly: true
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+        - name: frontend
+          image: harbor.pic-aichem.online/sunyk/des-system-design-frontend:v0.1.2
+          imagePullPolicy: Always
+          imagePullSecrets: 
+            - name: harbor-auth
+          ports:
+            - name: http-frontend
+              containerPort: 80
+
+          env:
+            - name: DASHSCOPE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: des-secrets
+                  key: DASHSCOPE_API_KEY
+
+          volumeMounts:
+            - name: des-nginx-config
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+      volumes:
+        - name: des-data
+          persistentVolumeClaim:
+            claimName: des-data-pvc
+        - name: des-logs
+          persistentVolumeClaim:
+            claimName: des-logs-pvc
+        - name: corerag-data
+          persistentVolumeClaim:
+            claimName: des-corerag-data-pvc
+        - name: largerag-data
+          persistentVolumeClaim:
+            claimName: des-largerag-data-pvc
+
+        - name: des-backend-config
+          configMap:
+            name: des-backend-config
+        - name: des-nginx-config
+          configMap:
+            name: des-nginx-config
