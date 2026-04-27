@@ -28,7 +28,6 @@ import dayjs from 'dayjs';
 import { recommendationService } from '../services';
 import type { RecommendationSummary } from '../types';
 import type { FormulationData } from '../types/formulation';
-import { getFormulationDisplayString } from '../utils/formulationUtils';
 
 const { Title, Paragraph, Text } = Typography;
 const { Search } = Input;
@@ -48,6 +47,80 @@ function RecommendationListPage() {
 
   // Track if there are any generating tasks for polling
   const [hasGeneratingTasks, setHasGeneratingTasks] = useState(false);
+
+  const renderMolarRatio = (molarRatio: string) => {
+    const ratioParts = molarRatio.split(/\s*:\s*/).filter(Boolean);
+
+    if (ratioParts.length === 0) {
+      return molarRatio;
+    }
+
+    return (
+      <span
+        style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          whiteSpace: 'nowrap',
+          fontVariantNumeric: 'tabular-nums',
+        }}
+      >
+        {ratioParts.map((part, index) => (
+          <span
+            key={`${part}-${index}`}
+            style={{ display: 'inline-flex', alignItems: 'center' }}
+          >
+            <span>{part}</span>
+            {index < ratioParts.length - 1 && (
+              <span
+                style={{
+                  margin: '0 10px',
+                  color: 'rgba(0, 0, 0, 0.45)',
+                }}
+              >
+                :
+              </span>
+            )}
+          </span>
+        ))}
+      </span>
+    );
+  };
+
+  const renderFormulationDisplay = (formulation: FormulationData) => {
+    const ratioDisplay = (
+      <span style={{ color: 'rgba(0, 0, 0, 0.45)' }}>
+        ({renderMolarRatio(formulation.molar_ratio)})
+      </span>
+    );
+
+    if (formulation.HBD && formulation.HBA) {
+      return (
+        <>
+          {formulation.HBD}
+          <span style={{ margin: '0 6px', color: 'rgba(0, 0, 0, 0.45)' }}>:</span>
+          {formulation.HBA} {ratioDisplay}
+        </>
+      );
+    }
+
+    if (formulation.components && formulation.components.length > 0) {
+      return (
+        <>
+          {formulation.components.map((component, index) => (
+            <span key={`${component.name}-${index}`}>
+              {index > 0 && (
+                <span style={{ margin: '0 6px', color: 'rgba(0, 0, 0, 0.45)' }}>+</span>
+              )}
+              {component.name}
+            </span>
+          ))}{' '}
+          {ratioDisplay}
+        </>
+      );
+    }
+
+    return <>Unknown formulation {ratioDisplay}</>;
+  };
 
   // Status counts for all tabs (always displayed)
   const [statusCounts, setStatusCounts] = useState<{
@@ -184,7 +257,7 @@ function RecommendationListPage() {
         }
         return (
           <Typography.Text strong>
-            {getFormulationDisplayString(formulation)}
+            {renderFormulationDisplay(formulation)}
           </Typography.Text>
         );
       },
