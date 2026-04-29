@@ -33,6 +33,28 @@ import type {
 const { Title, Paragraph, Text } = Typography;
 const { TextArea } = Input;
 
+function formatRatioNumber(value: number): string {
+  return value.toFixed(4).replace(/\.?0+$/, '');
+}
+
+function buildSolidLiquidRatioText(
+  solidMass?: number,
+  liquidMass?: number
+): string | undefined {
+  if (
+    solidMass === undefined ||
+    solidMass === null ||
+    liquidMass === undefined ||
+    liquidMass === null ||
+    solidMass <= 0 ||
+    liquidMass < 0
+  ) {
+    return undefined;
+  }
+
+  return `1:${formatRatioNumber(liquidMass / solidMass)} g:g`;
+}
+
 function FeedbackPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -41,10 +63,23 @@ function FeedbackPage() {
   const [submitting, setSubmitting] = useState(false);
   const [detail, setDetail] = useState<RecommendationDetail | null>(null);
   const [isLiquidFormed, setIsLiquidFormed] = useState<boolean>(true);
+  const solidLiquidRatio = Form.useWatch(['conditions', 'solid_liquid_ratio'], form);
 
   // Processing status
   const [isProcessing, setIsProcessing] = useState(false);
   const [processingStatus, setProcessingStatus] = useState<FeedbackStatusData | null>(null);
+
+  useEffect(() => {
+    const solidMass = solidLiquidRatio?.solid_mass_g;
+    const liquidMass = solidLiquidRatio?.liquid_volume_ml;
+    const nextRatioText = buildSolidLiquidRatioText(solidMass, liquidMass);
+
+    if (nextRatioText && solidLiquidRatio?.ratio_text !== nextRatioText) {
+      form.setFieldValue(['conditions', 'solid_liquid_ratio', 'ratio_text'], nextRatioText);
+    } else if (!nextRatioText && solidLiquidRatio?.ratio_text) {
+      form.setFieldValue(['conditions', 'solid_liquid_ratio', 'ratio_text'], undefined);
+    }
+  }, [form, solidLiquidRatio]);
 
   useEffect(() => {
     if (!id) return;
@@ -169,11 +204,6 @@ function FeedbackPage() {
           content: `反馈处理完成！提取了 ${finalStatus.data.result?.num_memories || 0} 条记忆`,
           duration: 5,
         });
-
-        // Wait a bit then navigate
-        setTimeout(() => {
-          navigate(`/recommendations/${id}`);
-        }, 2000);
 
       } catch (pollError: any) {
         console.error('Polling error:', pollError);
@@ -322,11 +352,11 @@ function FeedbackPage() {
               }
               extra={[
                 <Button
-                  key="detail"
+                  key="confirm"
                   type="primary"
                   onClick={() => navigate(`/recommendations/${id}`)}
                 >
-                  查看详情
+                  确定
                 </Button>,
                 <Button key="list" onClick={() => navigate('/recommendations')}>
                   返回列表
@@ -422,7 +452,7 @@ function FeedbackPage() {
           onFinish={handleSubmit}
           initialValues={{
             is_liquid_formed: true,
-            conditions: { temperature_C: undefined, solid_liquid_ratio: { ratio_text: '1:10 g:mL' } },
+            conditions: { temperature_C: undefined, solid_liquid_ratio: { ratio_text: undefined } },
             measurements: [
               { target_material: detail.task?.target_material, time_h: 1, unit: '%' }
             ],
@@ -466,8 +496,15 @@ function FeedbackPage() {
             <Form.Item label="液体质量 (g)" name={['conditions', 'solid_liquid_ratio', 'liquid_volume_ml']}>
               <InputNumber min={0} step={0.1} placeholder="例如 10.0" />
             </Form.Item>
-            <Form.Item label="固液比文本" name={['conditions', 'solid_liquid_ratio', 'ratio_text']}>
-              <Input placeholder="例如 1:10 (g:g)" />
+            <Form.Item
+              label="固液比文本"
+              name={['conditions', 'solid_liquid_ratio', 'ratio_text']}
+              tooltip="输入固体质量和液体质量后会自动计算为 g:g"
+            >
+              <Input
+                readOnly
+                placeholder="输入质量后自动计算，例如 1:10 g:g"
+              />
             </Form.Item>
           </Space>
 

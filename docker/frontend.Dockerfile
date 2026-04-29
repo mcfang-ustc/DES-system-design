@@ -1,16 +1,23 @@
 # Frontend Dockerfile for DES Formulation System
 # Multi-stage build: Node.js build -> Nginx serve
 
+# Allow mirror registries to override the default Docker Hub images when needed.
+ARG NODE_IMAGE=docker.io/library/node:20-alpine
+ARG NGINX_IMAGE=docker.io/library/nginx:alpine
+
 # ============ Build Stage ============
-FROM node:20-alpine AS builder
+FROM ${NODE_IMAGE} AS builder
 
 WORKDIR /app
 
 # Copy package files
 COPY src/web_frontend/package*.json ./
 
+# Allow an alternate npm registry in restricted network environments.
+ARG NPM_REGISTRY=
+
 # Install dependencies (including devDependencies for build)
-RUN npm ci
+RUN if [ -n "$NPM_REGISTRY" ]; then npm config set registry "$NPM_REGISTRY"; fi && npm ci
 
 # Copy source code
 COPY src/web_frontend/ ./
@@ -24,7 +31,7 @@ ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
 RUN npm run build
 
 # ============ Production Stage ============
-FROM nginx:alpine
+FROM ${NGINX_IMAGE}
 
 # Copy built files from builder
 COPY --from=builder /app/dist /usr/share/nginx/html
